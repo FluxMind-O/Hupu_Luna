@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "Hupu Luna main module"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "Hupu Luna client"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "Hupu Luna"
+    }
+  ]
+}

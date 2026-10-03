@@ -1,0 +1,11 @@
+{
+  "modelVersion": "6.0.0",
+  "description": "Hupu Luna - 纯净版虎扑第三方客户端",
+  "dependencies": {
+    "@ohos/imageknife": "^3.2.10"
+  },
+  "devDependencies": {
+  },
+  "dynamicDependencies": {
+  }
+}
