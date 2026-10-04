@@ -253,7 +253,15 @@ export class PlayerScoreRow {
   starter: boolean = false;
   scoreAvg: number = 0;
   scoreCount: number = 0;
+  /** 评分分布（roster 接口直接返回 {"2":n,"4":n,...}），SSR 空化时补齐详情页用 */
+  scoreDistribution: ScoreBucket[] = [];
   comment: string = '';
+  /** 亮评作者/时间/地点/点亮数（rosterScoreStats.comment 扩展字段，缺失为空） */
+  commentUser: string = '';
+  commentStar: number = 0;
+  commentTime: string = '';
+  commentLocation: string = '';
+  commentLights: number = 0;
 }
 
 /** 比赛日（赛程分组） */
@@ -291,6 +299,32 @@ export class PlayerScoreDetail {
   scoreAvg: number = 0;
   scoreCount: number = 0;
   buckets: ScoreBucket[] = [];
+  /** 亮回复列表（SSR hotComment，可能多条；无法获取时为空） */
+  comments: PlayerScoreComment[] = [];
+}
+
+/** 球员评分亮回复（latestCommentList / roster comment，官方同套 DTO） */
+export class PlayerScoreComment {
+  commentId: string = '';
+  userId: string = '';
+  userName: string = '';
+  avatar: string = '';
+  /** 评论者给球员打的分（2~10，映射 1~5 星），无分为 0 */
+  score: number = 0;
+  content: string = '';
+  timeText: string = '';
+  location: string = '';
+  lightCount: number = 0;
+  /** 楼中楼引用（parentCommentCanSee 时展示） */
+  replyToUser: string = '';
+  replyToContent: string = '';
+}
+
+/** 球员评分评论分页（latestCommentList 响应） */
+export class PlayerCommentPage {
+  list: PlayerScoreComment[] = [];
+  /** 下一页游标（publishTime，空 = 没有更多） */
+  cursor: string = '';
 }
 
 /** 战报事件（进球/红牌/关键镜头等） */

@@ -188,6 +188,14 @@
 | 发现方式 | `offline-download.hupu.com/online/prod/330003/playerInfo-data.html` 的 bundle | 该页面是 App 内嵌的球员资料 H5，其 JS 暴露了上述整个 API 家族 |
 
 > **评论接口最终结论（2026-10-03 穷举验证完毕）**：官方评论流（亮回复/29）走 `POST playerStaff/latestCommentList`。穷举测试均失败：① 长/短/gid 三种 playerId（报 "playerModel null" → ID 体系不符）② 真实球员+真实比赛（如 SGA + 雷霆马刺 172万评分场）→ `success:true, result:null`（服务端返回空）③ DTO 泄露字段补偿（order=desc/asc/light、customId、cursorMap、userId 变体）全部空 ④ 12 个 API 版本号（3/7.3.0 ~ 3/8.0.0）全部空。**结论：评论数据服务端对非 App 签名请求一律返回空，Web 端不可达**。评分详情页展示每名球员的**单条热评**（rosterScoreStats.comment 字段，内容与官方亮评一致）作为替代。
+>
+> **评论接口 2026-10-04 二次深挖（官方 H5 源码逆向 + APK dex 逆向）**：
+> ① **方法修正**：2026-10-03 用 GET 测的——实测报 `Request method 'GET' is not supported`，正确方法是 **POST**（GET 判死结论作废）。
+> ② **官方调用完整还原**（扒 m.hupu.com 评分页 webpack chunk `597-e78c43c9f36e83ed.js`）：`POST https://games.mobileapi.hupu.com/3/7.5.60/basketballapi/playerStaff/latestCommentList`，参数体 `{matchId, userId, limit, order, cursorMap:{publishTime}, playerId, staffId}`（球员用 playerId、教练裁判用 staffId；响应 `result.commentDTOList[]` + `result.cursorMap.publishTime` 游标分页；order 三值 `""`/`latest`/`early` = 最亮/最晚/最早）。**H5 axios 拦截器无任何签名头**（仅性能埋点），裸 HTTP。
+> ③ **仍拿不到数据的根因**：`success:true, result:null` —— userId 需登录态，且 games 网关只认 **games 域 App 登录凭证**（官方 App 内嵌 WebView 的 games 域 cookie/token 由 App 原生层注入），bbs 域 cookie（ua/u/us）不被 games 网关识别（带 Cookie 实测无效）。官方 App 球员评分页即内嵌 H5（m.hupu.com/basketball-player-score），靠 App WebView games 域登录态拿数。
+> ④ **APK dex 逆向**（98MB dex）：BPL 评论接口族全曝光（`bplcommentapi/bpl/comment/list/primarySingleRow` 主评 / `getMore` / `hottest` / `subCommentList` 楼中楼 / `comment/publish` / `comment/light` / `score_tab/detail` / `score_tree/*`，独立 BPL 网关）——实测 games.mobileapi 网关 `No static resource`，BPL 网关域名 dex 未泄露（运行时下发）；另有 `GET /player/v1/{gameType}/getAllPlayerScore`（**接口存在**：业务报错"参数不完整"而非 404，返回 `is_login:0`）与 `/matchallapi/queryMatchAllScoreInfo`，参数结构未在字符串池泄露。
+> ⑤ **最终结论**：完整评论流（多条+楼中楼）需要 games 域登录凭证——唯一途径抓包官方 App（SSL pinning 需绕过）。未获取前**评分详情页评论区块 = roster 单条热评**（官方亮评同数据源；降级自动触发：latestCommentList 空/失败 → roster comment）。
+> ⑥ **SSR 评分数据空化修正（2026-10-04 实测）**：SSR `scoreInfo.playerInfo` 对未登录请求返回 userScoreAvg/userScoreCount/scoreDistribution **全空**（即"共 0 人打分"现象），但 stats（得分/篮板等）正常——**官方 App 评分数据实际来自 roster 接口**（teamMatchRosterScoreStats 返回完整 userScoreAvg/userScoreCount/scoreDistribution + comment）。详情页 = SSR 骨架 + **roster 补齐评分**（scoreCount>0 覆盖；分布全 0 判定后整体替换）。
 
 > **球员评分详情口径（2026-10-03 突破）**：`GET m.hupu.com/basketball-player-score?id={playerId}&matchId={matchId}&role=player`（Next.js SSR，参数齐全即返回数据）→ `__NEXT_DATA__.props.pageProps.scoreInfo`：`playerInfo`（完整数据+userScoreAvg/userScoreCount）+ `scoreDistribution`（{"2":n,"4":n,"6":n,"8":n,"10":n} 分档）+ `hotComment`；`role=staff` 时 id 需用短格式 staffId。评论流接口 `playerStaff/latestCommentList` 老比赛数据可能为空，暂不接入。
 

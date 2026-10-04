@@ -362,13 +362,14 @@ export struct ProfilePage {
             .textAlign(TextAlign.Center)
             .padding({ top: 10, bottom: 20 })
         }
-        .padding({ left: Spacing.lg, right: Spacing.lg, top: 26, bottom: 10 })
+        .padding({ left: Spacing.lg, right: Spacing.lg, top: 10, bottom: 10 })
         .width('100%')
+        // 内容不足一屏时撑满 Scroll 视口，强制从顶部开始布局（align 顶层对齐真机不可靠）
+        .constraintSize({ minHeight: '100%' })
       }
       .layoutWeight(1)
       .width('100%')
       .scrollBar(BarState.Off)
-      // 内容不足一屏时 Scroll 默认居中，显式顶对齐避免"我的"卡片悬在屏幕中部
       .align(Alignment.Top)
     }
     .width('100%')

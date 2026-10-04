@@ -1,10 +1,13 @@
-import { HttpManager } from './HttpManager';
+import { HttpManager, ExtraHeaders } from './HttpManager';
+import { SessionManager } from './SessionManager';
 import {
   NbaNewsItem,
   MatchItem,
   MatchDay,
   PlayerScoreRow,
   PlayerScoreDetail,
+  PlayerScoreComment,
+  PlayerCommentPage,
   ScoreBucket,
   PlayerHeadInfo,
   PlayerStatItem,
@@ -91,6 +94,58 @@ interface NbaScheduleRespDto {
   props?: NbaScheduleDataDto;
 }
 
+/* ---- 球员评分评论流（3/7.5.60 playerStaff/latestCommentList，官方 H5 同款 POST） ---- */
+
+interface LatestCommentCursorDto {
+  publishTime?: string | null;
+}
+
+/** 评论条目（与 roster comment 同套 DTO + 完整楼中楼字段） */
+interface ScoreCommentFullDto {
+  commentId?: string | null;
+  commentUserId?: string | null;
+  commentUserName?: string | null;
+  commentUserHeadImg?: string | null;
+  commentContent?: string | null;
+  commentDate?: string | null;
+  score?: number | null;
+  lightCount?: number | null;
+  blackCount?: number | null;
+  parentCommentCanSee?: boolean | null;
+  parentCommentUserId?: string | null;
+  parentCommentUserName?: string | null;
+  parentCommentUserHeadImg?: string | null;
+  parentCommentContent?: string | null;
+  parentCommentId?: string | null;
+}
+
+interface LatestCommentResultDto {
+  commentDTOList?: ScoreCommentFullDto[] | null;
+  cursorMap?: LatestCommentCursorDto | null;
+}
+
+interface LatestCommentApiRespDto {
+  success?: boolean;
+  result?: LatestCommentResultDto | null;
+  errorMsg?: string | null;
+}
+
+/** 请求体游标（publishTime 翻页） */
+class PublishTimeCursor {
+  publishTime: string = '';
+}
+
+/** latestCommentList 请求体（官方参数集） */
+class LatestCommentReqBody {
+  matchId: string = '';
+  userId: string = '';
+  limit: number = 20;
+  order: string = '';
+  cursorMap: PublishTimeCursor = new PublishTimeCursor();
+  playerId: string = '';
+  staffId: string = '';
+}
+
 /* ---- 球员评分详情（basketball-player-score SSR） ---- */
 
 interface ScoreDetailInfoDto {
@@ -117,9 +172,34 @@ interface ScoreDetailInfoDto {
   userScoreCount?: number;
 }
 
+/**
+ * 亮回复条目（SSR hotComment / roster comment 的防御性候选字段集）。
+ * 官方未公开该数据结构，字段名按虎扑惯例多名单备，命中即展示、不中为空。
+ */
+interface ScoreHotCommentDto {
+  content?: string | null;
+  commentContent?: string | null;
+  userName?: string | null;
+  nickName?: string | null;
+  nickname?: string | null;
+  avatar?: string | null;
+  header?: string | null;
+  userHeader?: string | null;
+  starLevel?: number | null;
+  userStar?: number | null;
+  createTime?: string | null;
+  timeStr?: string | null;
+  lightNum?: number | null;
+  lightCount?: number | null;
+  location?: string | null;
+  province?: string | null;
+}
+
 interface ScoreDetailInfoWrapDto {
   playerInfo?: ScoreDetailInfoDto;
   scoreDistribution?: Record<string, number>;
+  /** 亮回复：官方形态未知（单条对象/数组/字符串），防御性三态解析 */
+  hotComment?: ScoreHotCommentDto | ScoreHotCommentDto[] | string | null;
 }
 
 interface ScoreDetailPagePropsDto {
@@ -250,10 +330,27 @@ interface ScoreStatsDto {
   starter?: number;
   userScoreAvg?: number | null;
   userScoreCount?: number | null;
+  /** 评分分布（官方 App 同款 {"2":n,"4":n,"6":n,"8":n,"10":n}） */
+  scoreDistribution?: Record<string, number> | null;
 }
 
 interface ScoreCommentDto {
   commentContent?: string | null;
+  content?: string | null;
+  userName?: string | null;
+  nickName?: string | null;
+  nickname?: string | null;
+  avatar?: string | null;
+  header?: string | null;
+  userHeader?: string | null;
+  starLevel?: number | null;
+  userStar?: number | null;
+  createTime?: string | null;
+  timeStr?: string | null;
+  lightNum?: number | null;
+  lightCount?: number | null;
+  location?: string | null;
+  province?: string | null;
 }
 
 interface ScorePlayerDto {
@@ -524,6 +621,19 @@ export class NbaApi {
     return stage;
   }
 
+  /** 亮回复 DTO → 模型（候选字段逐一回退） */
+  private static mapHotComment(c: ScoreHotCommentDto): PlayerScoreComment {
+    const m: PlayerScoreComment = new PlayerScoreComment();
+    m.content = c.content ?? c.commentContent ?? '';
+    m.userName = c.userName ?? c.nickName ?? c.nickname ?? '';
+    m.avatar = c.avatar ?? c.header ?? c.userHeader ?? '';
+    m.score = (c.starLevel ?? c.userStar ?? 0) * 2;
+    m.timeText = c.createTime ?? c.timeStr ?? '';
+    m.lightCount = c.lightNum ?? c.lightCount ?? 0;
+    m.location = c.location ?? c.province ?? '';
+    return m;
+  }
+
   /** 球员评分详情（含评分分布分档，来自 basketball-player-score SSR 页面） */
   static async getPlayerScoreDetail(matchId: string, playerId: string): Promise<PlayerScoreDetail> {
     const url: string = `${BASE}/basketball-player-score?id=${playerId}&matchId=${matchId}&role=player`;
@@ -566,6 +676,31 @@ export class NbaApi {
       }
     }
     detail.buckets = buckets;
+    // 亮回复：SSR hotComment 三态（数组/单条对象/字符串），防御性解析
+    try {
+      const hc = resp.props?.pageProps?.scoreInfo?.hotComment;
+      const list: PlayerScoreComment[] = [];
+      if (typeof hc === 'string') {
+        if (hc.length > 0) {
+          const c: PlayerScoreComment = new PlayerScoreComment();
+          c.content = hc;
+          list.push(c);
+        }
+      } else if (Array.isArray(hc)) {
+        for (const it of hc) {
+          if (it && (it.content ?? it.commentContent ?? '').length > 0) {
+            list.push(NbaApi.mapHotComment(it));
+          }
+        }
+      } else if (hc) {
+        if ((hc.content ?? hc.commentContent ?? '').length > 0) {
+          list.push(NbaApi.mapHotComment(hc));
+        }
+      }
+      detail.comments = list;
+    } catch (e) {
+      detail.comments = [];
+    }
     return detail;
   }
 
@@ -602,11 +737,86 @@ export class NbaApi {
       row.starter = s.starter === 1;
       row.scoreAvg = s.userScoreAvg ?? 0;
       row.scoreCount = s.userScoreCount ?? 0;
-      row.comment = p.comment?.commentContent ?? '';
+      row.comment = p.comment?.commentContent ?? p.comment?.content ?? '';
+      // 评分分布（官方 App 数据源，SSR 空化时由本接口补齐详情页）
+      const dist = s.scoreDistribution;
+      if (dist) {
+        for (const key of ['2', '4', '6', '8', '10']) {
+          const b: ScoreBucket = new ScoreBucket();
+          b.score = Number.parseInt(key);
+          b.count = dist[key] ?? 0;
+          row.scoreDistribution.push(b);
+        }
+      }
+      row.commentUser = p.comment?.userName ?? p.comment?.nickName ?? p.comment?.nickname ?? '';
+      row.commentStar = p.comment?.starLevel ?? p.comment?.userStar ?? 0;
+      row.commentTime = p.comment?.createTime ?? p.comment?.timeStr ?? '';
+      row.commentLocation = p.comment?.location ?? p.comment?.province ?? '';
+      row.commentLights = p.comment?.lightNum ?? p.comment?.lightCount ?? 0;
       result.push(row);
     }
     result.sort((a: PlayerScoreRow, b: PlayerScoreRow): number => b.scoreAvg - a.scoreAvg);
     return result;
+  }
+
+  /**
+   * 球员评分评论流（逆向官方 H5 同款：POST 3/7.5.60 playerStaff/latestCommentList）。
+   * 参数体 = {matchId,userId,limit,order,cursorMap,playerId,staffId}（dex 内 official 参数集）；
+   * 响应 result.commentDTOList[] + result.cursorMap.publishTime 游标分页；
+   * 需登录态（userId = 虎扑 uid），未登录服务端返回 result:null。
+   * order：""=最亮（默认）/ "latest"=最晚 / "early"=最早（官方三页签）。
+   */
+  static async getPlayerComments(matchId: string, playerId: string, userId: string,
+    order: string, cursor: string): Promise<PlayerCommentPage> {
+    const url: string = `https://games.mobileapi.hupu.com/3/7.5.60/basketballapi/playerStaff/latestCommentList`;
+    const bodyObj: LatestCommentReqBody = new LatestCommentReqBody();
+    bodyObj.matchId = matchId;
+    bodyObj.userId = userId;
+    bodyObj.order = order;
+    bodyObj.playerId = playerId;
+    if (cursor.length > 0) {
+      bodyObj.cursorMap.publishTime = cursor;
+    }
+    const body: string = JSON.stringify(bodyObj);
+    const opts: ExtraHeaders = new ExtraHeaders();
+    opts.contentType = 'application/json';
+    // 登录态 Cookie（ua/u/us 核心三件套）：服务端按登录态返回评论流
+    opts.cookie = SessionManager.cookieHeader();
+    const text: string = await HttpManager.postJson(url, body, opts, '');
+    let resp: LatestCommentApiRespDto;
+    try {
+      resp = JSON.parse(text) as LatestCommentApiRespDto;
+    } catch (e) {
+      throw new Error('数据解析失败');
+    }
+    if (!resp.success) {
+      throw new Error(resp.errorMsg ?? '接口失败');
+    }
+    const page: PlayerCommentPage = new PlayerCommentPage();
+    const list = resp.result?.commentDTOList;
+    if (list) {
+      for (const c of list) {
+        const m: PlayerScoreComment = new PlayerScoreComment();
+        m.commentId = c.commentId ?? '';
+        m.userId = c.commentUserId ?? '';
+        m.userName = c.commentUserName ?? '';
+        m.avatar = c.commentUserHeadImg ?? '';
+        m.content = c.commentContent ?? '';
+        m.timeText = c.commentDate ?? '';
+        m.lightCount = c.lightCount ?? 0;
+        m.score = c.score ?? 0;
+        if (c.parentCommentCanSee === true && (c.parentCommentContent ?? '').length > 0) {
+          m.replyToUser = c.parentCommentUserName ?? '';
+          m.replyToContent = c.parentCommentContent ?? '';
+        }
+        if (m.content.length > 0) {
+          page.list.push(m);
+        }
+      }
+    }
+    const cur = resp.result?.cursorMap?.publishTime;
+    page.cursor = cur ?? '';
+    return page;
   }
 
   private static mapMatch(m: NbaMatchDto): MatchItem {

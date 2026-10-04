@@ -1,7 +1,7 @@
 import { HupuApi } from '../network/HupuApi';
 import { ThreadListItem, ThreadListPage, TopicInfo } from '../model/Models';
 import { LoadState, StateView } from '../views/StateView';
-import { Spacing, FontSize, Radius, RouteName } from '../common/Theme';
+import { Spacing, RouteName } from '../common/Theme';
 import { compactCount } from '../views/TagChip';
 import { thumbUrl } from '../common/Utils';
 import { ImageKnifeComponent } from '@ohos/imageknife';
@@ -198,42 +198,39 @@ export struct TopicThreadsPage {
     .backgroundColor($r('app.color.bg_card'))
   }
 
+  /** 官方排版：作者行（灰）→ 标题（大字）→ meta 行（左 回复/浏览 · 右 时间），块间大留白 */
   @Builder
   ThreadRow(item: ThreadListItem) {
-    Column({ space: 6 }) {
+    Column({ space: 8 }) {
+      Text(item.userName)
+        .fontSize(12)
+        .fontColor($r('app.color.text_secondary'))
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .width('100%')
       Text(item.title)
-        .fontSize(FontSize.title)
+        .fontSize(17)
         .fontWeight(FontWeight.Medium)
         .fontColor($r('app.color.text_primary'))
         .maxLines(2)
         .textOverflow({ overflow: TextOverflow.Ellipsis })
         .width('100%')
-      Row({ space: 10 }) {
-        Text(item.userName)
+      Row() {
+        Text(item.visits > 0
+          ? `${compactCount(item.replies)} 回复 / ${compactCount(item.visits)} 浏览`
+          : `${compactCount(item.replies)} 回复`)
           .fontSize(12)
-          .fontColor($r('app.color.text_secondary'))
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .layoutWeight(1)
-        Text(item.time)
-          .fontSize(11)
           .fontColor($r('app.color.text_tertiary'))
-        if (item.replies > 0) {
-          Text(`${compactCount(item.replies)} 回复`)
-            .fontSize(11)
-            .fontColor($r('app.color.text_tertiary'))
-        }
-        if (item.visits > 0) {
-          Text(`${compactCount(item.visits)} 浏览`)
-            .fontSize(11)
-            .fontColor($r('app.color.text_tertiary'))
-        }
+        Blank()
+        Text(item.time)
+          .fontSize(12)
+          .fontColor($r('app.color.text_tertiary'))
       }
       .width('100%')
     }
     .width('100%')
     .alignItems(HorizontalAlign.Start)
-    .padding({ left: Spacing.lg, right: Spacing.lg, top: 12, bottom: 12 })
+    .padding({ left: Spacing.lg, right: Spacing.lg, top: 14, bottom: 14 })
     .backgroundColor($r('app.color.bg_card'))
     .onClick(() => {
       this.openThread(item.tid);

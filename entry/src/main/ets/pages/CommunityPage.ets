@@ -5,6 +5,7 @@ import { Spacing, FontSize, Radius, RouteName } from '../common/Theme';
 import { ImageKnifeComponent } from '@ohos/imageknife';
 import { preferences } from '@kit.ArkData';
 import { common } from '@kit.AbilityKit';
+import { hilog } from '@kit.PerformanceAnalysisKit';
 
 const STORE_NAME: string = 'hupluna_settings';
 const KEY_MY_TOPICS: string = 'my_topic_ids';
@@ -26,6 +27,7 @@ export struct CommunityPage {
   private leftScroller: Scroller = new Scroller();
   private suppressSync: boolean = false;
   private leftManual: boolean = false;
+  private suppressTimer: number = -1;
 
   aboutToAppear(): void {
     this.ctx = this.getUIContext().getHostContext() as common.Context;
@@ -123,40 +125,25 @@ export struct CommunityPage {
     }
   }
 
-  /** 右侧滚动 → 联动左侧选中态（-1=我的，其余=分类下标；检查相邻边界 + 末 section 完全入视口） */
-  private syncActiveFromScroll(): void {
+  /**
+   * 右侧 List 滚动 → 联动左侧选中态。
+   * List index：0=我的，i+1=分类 i。first=视口顶部可见项 → 头部过顶即切换，与官方行为一致；
+   * 滚到底（last 达最后分类项）强制选中末分类，保证短区块也能被高亮。
+   */
+  private syncActiveFromList(first: number, last: number): void {
     if (this.suppressSync || this.categories.length === 0) {
       return;
     }
-    try {
-      const ui = this.getUIContext();
-      const len: number = this.categories.length;
-      const idx: number = this.activeIndex;
-      const cur: number = idx >= 0 ? idx : 0;
-      const area = ui.getComponentUtils().getRectangleById('zone_scroll_area');
-      const areaTop: number = area.windowOffset.y;
-      const last = ui.getComponentUtils().getRectangleById('zone_sec_' + (len - 1));
-      if (last.windowOffset.y + last.size.height <= area.windowOffset.y + area.size.height && cur < len - 1) {
-        this.setActive(len - 1);
-        return;
-      }
-      const curTop = ui.getComponentUtils().getRectangleById('zone_sec_' + cur).windowOffset.y;
-      if (curTop > areaTop + 2) {
-        this.setActive(cur > 0 ? cur - 1 : -1);
-        return;
-      }
-      if (idx < 0) {
-        this.setActive(0);
-        return;
-      }
-      if (cur + 1 < len) {
-        const nextTop = ui.getComponentUtils().getRectangleById('zone_sec_' + (cur + 1)).windowOffset.y;
-        if (nextTop <= areaTop + 2) {
-          this.setActive(cur + 1);
-        }
-      }
-    } catch (e) {
+    const len: number = this.categories.length;
+    if (last >= len && first >= 1) {
+      this.setActive(len - 1);
+      return;
     }
+    if (first <= 0) {
+      this.setActive(-1);
+      return;
+    }
+    this.setActive(first - 1);
   }
 
   /** 选中态变更（-1=我的）+ 左侧导航滚动到可见 */
@@ -200,7 +187,11 @@ export struct CommunityPage {
     }
   }
 
-  /** 点击左侧栏目（-1=我的）→ 右侧滚动定位到对应区块 */
+  /**
+   * 点击左侧栏目（-1=我的）→ 右侧 List 按索引定位区块头部。
+   * scrollToIndex(ScrollAlign.START) 是框架原生锚点定位：不依赖手工测量/换算，
+   * 无动画瞬移必然精确对齐 item 顶；静默窗口延时解除避免滚动回调抢高亮。
+   */
   private scrollToSection(i: number): void {
     const len: number = this.categories.length;
     if (i < -1 || i >= len) {
@@ -208,23 +199,18 @@ export struct CommunityPage {
     }
     this.setActive(i);
     this.suppressSync = true;
+    const idx: number = i === -1 ? 0 : i + 1;
     try {
-      const ui = this.getUIContext();
-      const id: string = i === -1 ? 'zone_sec_my' : 'zone_sec_' + i;
-      const rect = ui.getComponentUtils().getRectangleById(id);
-      const areaTop = ui.getComponentUtils().getRectangleById('zone_scroll_area').windowOffset.y;
-      const cur = this.rightScroller.currentOffset().yOffset;
-      const target: number = cur + (rect.windowOffset.y - areaTop);
-      this.rightScroller.scrollTo({
-        xOffset: 0,
-        yOffset: Math.max(0, target),
-        animation: { duration: 250, curve: Curve.EaseOut }
-      });
+      this.rightScroller.scrollToIndex(idx, false, ScrollAlign.START);
     } catch (e) {
+      hilog.error(0x0000, 'HupuLuna', 'scrollToIndex failed idx=%{public}d err=%{public}s', idx, String(e));
     }
-    setTimeout(() => {
+    if (this.suppressTimer >= 0) {
+      clearTimeout(this.suppressTimer);
+    }
+    this.suppressTimer = setTimeout(() => {
       this.suppressSync = false;
-    }, 300);
+    }, 400);
   }
 
 
@@ -340,16 +326,16 @@ export struct CommunityPage {
           Blank()
           Row() {
             Text('搜索专区')
-              .fontSize(12)
+              .fontSize(11)
               .fontColor($r('app.color.text_tertiary'))
               .maxLines(1)
               .width('100%')
           }
-          .width(160)
-          .height(34)
+          .width(120)
+          .height(30)
           .padding({ left: 12, right: 12 })
           .backgroundColor($r('app.color.tag_bg'))
-          .borderRadius(17)
+          .borderRadius(15)
           .onClick(() => {
             this.searchMode = true;
           })
@@ -478,96 +464,96 @@ export struct CommunityPage {
             this.leftManual = false;
           })
 
-          // 右侧内容：全部分区区块依序拼接，上下滚动联动左侧选中态
-          Column() {
-            Scroll(this.rightScroller) {
+          // 右侧内容：List + ListItem（每区块一项），scrollToIndex 原生锚点定位 + onScrollIndex 联动
+          List({ space: 10, scroller: this.rightScroller }) {
+            ListItem() {
+              // 我的分区区块
               Column({ space: 10 }) {
-                // 我的分区区块
+                Row() {
+                  Text('我的')
+                    .fontSize(15)
+                    .fontWeight(FontWeight.Bold)
+                    .fontColor($r('app.color.text_primary'))
+                  Blank()
+                  Text('长按卡片可添加/移除')
+                    .fontSize(10)
+                    .fontColor($r('app.color.text_tertiary'))
+                }
+                .width('100%')
+
+                if (this.myTopics.length > 0) {
+                  Grid() {
+                    ForEach(this.myTopics, (t: ZoneTopic) => {
+                      GridItem() {
+                        this.TopicCell(t)
+                      }
+                    }, (t: ZoneTopic) => `my_${t.topicId}`)
+                  }
+                  .columnsTemplate('1fr 1fr 1fr')
+                  .columnsGap(6)
+                  .rowsGap(6)
+                  .width('100%')
+                  .height(Math.ceil(this.myTopics.length / 3) * 110)
+                } else {
+                  Text('长按下方分区卡片，添加到"我的"')
+                    .fontSize(11)
+                    .fontColor($r('app.color.text_tertiary'))
+                    .width('100%')
+                    .textAlign(TextAlign.Center)
+                    .padding(14)
+                    .backgroundColor($r('app.color.bg_card'))
+                    .borderRadius(Radius.md)
+                }
+              }
+              .id('zone_sec_my')
+              .width('100%')
+            }
+            .width('100%')
+
+            // 各分类分区区块（依序拼接）
+            ForEach(this.categories, (cat: ZoneCategory, index: number) => {
+              ListItem() {
                 Column({ space: 10 }) {
                   Row() {
-                    Text('我的')
+                    Text(cat.name)
                       .fontSize(15)
                       .fontWeight(FontWeight.Bold)
                       .fontColor($r('app.color.text_primary'))
                     Blank()
-                    Text('长按卡片可添加/移除')
+                    Text(`${cat.topics.length} 个分区`)
                       .fontSize(10)
                       .fontColor($r('app.color.text_tertiary'))
                   }
                   .width('100%')
 
-                  if (this.myTopics.length > 0) {
-                    Grid() {
-                      ForEach(this.myTopics, (t: ZoneTopic) => {
-                        GridItem() {
-                          this.TopicCell(t)
-                        }
-                      }, (t: ZoneTopic) => `my_${t.topicId}`)
-                    }
-                    .columnsTemplate('1fr 1fr 1fr')
-                    .columnsGap(6)
-                    .rowsGap(6)
-                    .width('100%')
-                    .height(Math.ceil(this.myTopics.length / 3) * 110)
-                  } else {
-                    Text('长按下方分区卡片，添加到"我的"')
-                      .fontSize(11)
-                      .fontColor($r('app.color.text_tertiary'))
-                      .width('100%')
-                      .textAlign(TextAlign.Center)
-                      .padding(14)
-                      .backgroundColor($r('app.color.bg_card'))
-                      .borderRadius(Radius.md)
+                  Grid() {
+                    ForEach(cat.topics, (t: ZoneTopic) => {
+                      GridItem() {
+                        this.TopicCell(t)
+                      }
+                    }, (t: ZoneTopic) => `sec${index}_${t.topicId}`)
                   }
-                }
-                .id('zone_sec_my')
-                .width('100%')
-
-                // 各分类分区区块（依序拼接）
-                ForEach(this.categories, (cat: ZoneCategory, index: number) => {
-                  Column({ space: 10 }) {
-                    Row() {
-                      Text(cat.name)
-                        .fontSize(15)
-                        .fontWeight(FontWeight.Bold)
-                        .fontColor($r('app.color.text_primary'))
-                      Blank()
-                      Text(`${cat.topics.length} 个分区`)
-                        .fontSize(10)
-                        .fontColor($r('app.color.text_tertiary'))
-                    }
-                    .width('100%')
-
-                    Grid() {
-                      ForEach(cat.topics, (t: ZoneTopic) => {
-                        GridItem() {
-                          this.TopicCell(t)
-                        }
-                      }, (t: ZoneTopic) => `sec${index}_${t.topicId}`)
-                    }
-                    .columnsTemplate('1fr 1fr 1fr')
-                    .columnsGap(6)
-                    .rowsGap(6)
-                    .width('100%')
-                    .height(Math.ceil(cat.topics.length / 3) * 110)
-                  }
-                  .id('zone_sec_' + index)
+                  .columnsTemplate('1fr 1fr 1fr')
+                  .columnsGap(6)
+                  .rowsGap(6)
                   .width('100%')
-                }, (cat: ZoneCategory, index: number) => `${cat.categoryId}_${index}`)
+                  .height(Math.ceil(cat.topics.length / 3) * 110)
+                }
+                .id('zone_sec_' + index)
+                .width('100%')
               }
-              .padding({ left: 10, right: 10, bottom: 20 })
               .width('100%')
-            }
-            .id('zone_scroll_area')
-            .scrollBar(BarState.Off)
-            .layoutWeight(1)
-            .width('100%')
-            .onDidScroll(() => {
-              this.syncActiveFromScroll();
-            })
+            }, (cat: ZoneCategory, index: number) => `${cat.categoryId}_${index}`)
           }
+          .id('zone_scroll_area')
+          .scrollBar(BarState.Off)
+          .edgeEffect(EdgeEffect.Spring)
           .layoutWeight(1)
-          .height('100%')
+          .width('100%')
+          .padding({ left: 10, right: 10, bottom: 20 })
+          .onScrollIndex((first: number, last: number) => {
+            this.syncActiveFromList(first, last);
+          })
         }
         .layoutWeight(1)
         .width('100%')
