@@ -90,6 +90,30 @@ export class WriteApi {
     return WriteApi.execute('https://bbs.hupu.com/pcmapi/pc/bbs/v1/createReply', body, true);
   }
 
+  /**
+   * 发帖（V2-P2 · createThread 路径已实测有效）。
+   *
+   * 提交结构逆向自 PC 站新编辑器：
+   *   { title, fid, content: HTML, format: JSON.stringify({slateValue, imgList, videoInfo}) }
+   * 其中 `content` 为 HTML（与旧格式一致，服务端兼容），
+   * `format` 为富文本描述（图片/视频/投票等卡片都在 slateValue 内）。
+   * format 为空时只提交旧三字段（纯文字帖）。
+   *
+   * @param format 富文本 JSON（可为空串）
+   */
+  static async createThread(title: string, fid: string, content: string, format: string): Promise<number> {
+    const fields: string[] = [
+      `"title":"${WriteApi.escapeJson(title)}"`,
+      `"fid":"${fid}"`,
+      `"content":"${WriteApi.escapeJson(content)}"`
+    ];
+    if (format.length > 0) {
+      fields.push(`"format":"${WriteApi.escapeJson(format)}"`);
+    }
+    const body = `{${fields.join(',')}}`;
+    return WriteApi.execute('https://bbs.hupu.com/pcmapi/pc/bbs/v1/createThread', body, true);
+  }
+
   private static escapeJson(s: string): string {
     let r: string = s;
     r = r.replace(/\\/g, '\\\\');

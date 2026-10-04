@@ -39,4 +39,5 @@ export class RouteName {
   static readonly PLAYER_PROFILE: string = 'PlayerProfile';
   static readonly LOGIN_WEB: string = 'LoginWeb';
   static readonly USER_SPACE: string = 'UserSpace';
+  static readonly CREATE_THREAD: string = 'CreateThread';
 }

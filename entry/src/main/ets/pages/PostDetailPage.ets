@@ -10,9 +10,16 @@ import { CacheStore } from '../database/CacheStore';
 import { CachedPayload } from '../database/CacheStore';
 import { SessionManager } from '../network/SessionManager';
 import { WriteApi } from '../network/WriteApi';
-import { promptAction } from '@kit.ArkUI';
+import { promptAction, display } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
 import { AppNavBar } from '../views/AppNavBar';
+import { ImageKnifeComponent } from '@ohos/imageknife';
+
+/** 视频区尺寸（vp） */
+class VideoBox {
+  w: number = 0;
+  h: number = 0;
+}
 
 @Component
 export struct PostDetailPage {
@@ -36,6 +43,25 @@ export struct PostDetailPage {
   @State replyTargetPid: string = '';
   @State replyTargetUser: string = '';
   @State lightingPid: string = '';
+  /**
+   * 视频帖播放状态。
+   * ready=已就绪（隐藏封面）/ playing=播放中 / muted=静音
+   * curSec/durSec=进度与总时长（秒）/ scrubbing=拖动进度条中
+   */
+  @State videoReady: boolean = false;
+  @State videoPlaying: boolean = false;
+  @State videoMuted: boolean = true;
+  @State videoCurSec: number = 0;
+  @State videoDurSec: number = 0;
+  @State videoScrubbing: boolean = false;
+  /** 视频控制器：Video 常驻不销毁，靠它控制播放/暂停/跳转，保住播放进度 */
+  private videoController: VideoController = new VideoController();
+  /** 静音按钮按下标记：防止点击穿透触发画面暂停 */
+  private mutePressed: boolean = false;
+  /** 离开页面时是否处于播放中（返回时据此续播） */
+  private resumeOnShow: boolean = false;
+  /** 内容区宽度缓存（vp，惰性计算） */
+  private cachedContentW: number = 0;
 
   aboutToAppear(): void {
     this.loadDetail();
@@ -65,7 +91,16 @@ export struct PostDetailPage {
 
   /** 应用详情模型到视图状态 */
   private applyDetail(d: ThreadDetail): void {
+    // 播放地址变化（缓存 → 网络最新链接）：重置播放态，等新视频就绪后重新自动播放
+    const urlChanged: boolean = d.videoUrl !== this.detail.videoUrl;
     this.detail = d;
+    if (urlChanged) {
+      this.videoReady = false;
+      this.videoPlaying = false;
+      this.videoCurSec = 0;
+      this.videoDurSec = 0;
+      this.videoScrubbing = false;
+    }
     const raw: string = d.content.trim();
     if (raw.length > 0 && raw.charAt(0) === '{') {
       this.contentText = '（本楼包含赛事卡片等富媒体内容，请在虎扑原帖中查看）';
@@ -73,6 +108,121 @@ export struct PostDetailPage {
     } else {
       this.contentText = htmlToText(d.content);
     }
+  }
+
+  /**
+   * 缓存详情归一化：旧版本快照无 hasVideo/videoUrl 等新增字段，
+   * 直接取用会在渲染期读到 undefined，逐字段兜底。
+   */
+  private normalizeDetail(raw: ThreadDetail): ThreadDetail {
+    const d: ThreadDetail = new ThreadDetail();
+    d.tid = raw.tid ?? '';
+    d.fid = raw.fid ?? '';
+    d.title = raw.title ?? '';
+    d.content = raw.content ?? '';
+    d.contentImages = raw.contentImages ?? [];
+    d.authorName = raw.authorName ?? '';
+    d.authorHeader = raw.authorHeader ?? '';
+    d.authorPuid = raw.authorPuid ?? '';
+    d.forumName = raw.forumName ?? '';
+    d.hits = raw.hits ?? 0;
+    d.replies = raw.replies ?? 0;
+    d.lights = raw.lights ?? 0;
+    d.hasVideo = raw.hasVideo === true;
+    d.videoUrl = raw.videoUrl ?? '';
+    d.videoCover = raw.videoCover ?? '';
+    d.videoWidth = raw.videoWidth ?? 0;
+    d.videoHeight = raw.videoHeight ?? 0;
+    return d;
+  }
+
+  /** 内容区宽度（vp）：屏幕宽 - 页面左右 padding（卡片自身 padding 已计入外层） */
+  private contentWidthVp(): number {
+    if (this.cachedContentW > 0) {
+      return this.cachedContentW;
+    }
+    let w: number = 328;
+    try {
+      const screenW: number = this.getUIContext().px2vp(display.getDefaultDisplaySync().width);
+      if (screenW > 0) {
+        w = screenW - Spacing.lg * 2;
+      }
+    } catch (e) {
+    }
+    this.cachedContentW = w;
+    return w;
+  }
+
+  /** 视频区尺寸：按原始宽高比计算，高度限幅 160~420vp（超高竖屏反算宽度并居中） */
+  private videoBox(): VideoBox {
+    const box: VideoBox = new VideoBox();
+    const cw: number = this.contentWidthVp();
+    let ratio: number = 1.78;
+    if (this.detail.videoWidth > 0 && this.detail.videoHeight > 0) {
+      ratio = this.detail.videoWidth / this.detail.videoHeight;
+    }
+    let h: number = cw / ratio;
+    let w: number = cw;
+    if (h < 160) {
+      h = 160;
+    }
+    if (h > 420) {
+      h = 420;
+      w = h * ratio;
+    }
+    box.w = w;
+    box.h = h;
+    return box;
+  }
+
+  /**
+   * 点击画面：暂停 / 继续。
+   * 走 VideoController 而非切换视频源，暂停后继续从原位置续播（不重头开始）。
+   */
+  private togglePlay(): void {
+    if (this.mutePressed) {
+      // 落在静音按钮上：只切静音，不切播放
+      return;
+    }
+    if (this.videoPlaying) {
+      this.videoController.pause();
+    } else {
+      this.videoController.start();
+    }
+  }
+
+  /** 静音按钮触摸：标记按下态，避免点击穿透触发画面暂停 */
+  private onMuteTouch(e: TouchEvent): void {
+    if (e.type === TouchType.Down) {
+      this.mutePressed = true;
+    } else if (e.type === TouchType.Up || e.type === TouchType.Cancel) {
+      setTimeout(() => {
+        this.mutePressed = false;
+      }, 0);
+    }
+  }
+
+  /** 进度条拖动/点击跳转：拖动期间用本地值，松手才 seek，避免与播放回调打架 */
+  private onScrub(value: number, mode: SliderChangeMode): void {
+    if (mode === SliderChangeMode.Begin || mode === SliderChangeMode.Moving) {
+      this.videoScrubbing = true;
+      this.videoCurSec = value;
+      return;
+    }
+    this.videoCurSec = value;
+    this.videoController.setCurrentTime(value);
+    this.videoScrubbing = false;
+  }
+
+  /** 秒 → mm:ss */
+  private formatSec(sec: number): string {
+    let s: number = Math.floor(sec);
+    if (s < 0 || Number.isNaN(s)) {
+      s = 0;
+    }
+    const m: number = Math.floor(s / 60);
+    const r: number = s % 60;
+    return `${m < 10 ? '0' : ''}${m}:${r < 10 ? '0' : ''}${r}`;
   }
 
   /** 写详情缓存（fire-and-forget，失败静默） */
@@ -93,7 +243,12 @@ export struct PostDetailPage {
     try {
       const d = JSON.parse(cached.json) as ThreadDetail;
       if (d && d.title) {
-        this.applyDetail(d);
+        const norm: ThreadDetail = this.normalizeDetail(d);
+        // 视频直链带时效 auth_key（数小时过期），缓存里的链接多数已失效：
+        // 缓存阶段不展示视频区，等网络返回最新链接再显示，避免"点了播不动"
+        norm.hasVideo = false;
+        norm.videoUrl = '';
+        this.applyDetail(norm);
         this.state = LoadState.Ready;
         this.refreshFavState();
       }
@@ -238,6 +393,29 @@ export struct PostDetailPage {
     this.pageStack.pushPathByName(RouteName.IMAGE_VIEWER, param);
   }
 
+  /** 点击评论头像/昵称 → 他人个人主页（puid 缺失时提示，不跳无效页） */
+  private openUserSpace(puid: string): void {
+    if (puid.length === 0) {
+      this.toastMsg('无法获取该用户信息');
+      return;
+    }
+    this.pageStack.pushPathByName(RouteName.USER_SPACE, puid);
+  }
+
+  /**
+   * 头像地址：PC 站返回的头像 URL 多自带 `@150h_150w_2e` 缩略样式，
+   * 再叠加 thumbUrl 的 `?x-oss-process=` 会参数冲突，故已带样式时直接用。
+   */
+  private avatarUrl(url: string): string {
+    if (url.length === 0) {
+      return '';
+    }
+    if (url.indexOf('@') >= 0) {
+      return url;
+    }
+    return thumbUrl(url, 120);
+  }
+
   private isExpanded(pid: string): boolean {
     for (const p of this.expandedPids) {
       if (p === pid) {
@@ -296,6 +474,122 @@ export struct PostDetailPage {
     this.loadingSubPid = '';
   }
 
+  /**
+   * 正文视频区：进入自动播放（静音），底部静音开关 + 进度条 + 时间。
+   * 关键：Video 组件**常驻不销毁**，暂停/继续一律走 VideoController，
+   * 避免组件重建导致"暂停后再播放从头开始"。
+   */
+  @Builder
+  VideoCard() {
+    Column() {
+      Stack({ alignContent: Alignment.Bottom }) {
+        Video({ src: this.detail.videoUrl, controller: this.videoController })
+          .autoPlay(true)
+          .muted(this.videoMuted)
+          .loop(true)
+          .controls(false)
+          .objectFit(ImageFit.Cover)
+          .width('100%')
+          .height('100%')
+          .onStart(() => {
+            this.videoPlaying = true;
+          })
+          .onPause(() => {
+            this.videoPlaying = false;
+          })
+          .onPrepared((e: PreparedInfo) => {
+            this.videoReady = true;
+            if (e.duration > 0) {
+              this.videoDurSec = e.duration;
+            }
+          })
+          .onUpdate((e: PlaybackInfo) => {
+            // 拖动进度条期间不由播放回调覆盖显示值
+            if (!this.videoScrubbing) {
+              this.videoCurSec = e.time;
+            }
+          })
+          .onClick(() => {
+            this.togglePlay();
+          })
+
+        // 封面层：视频就绪前遮挡加载期黑屏
+        if (!this.videoReady) {
+          if (this.detail.videoCover.length > 0) {
+            Image(thumbUrl(this.detail.videoCover, 720))
+              .width('100%')
+              .height('100%')
+              .objectFit(ImageFit.Cover)
+          } else {
+            Column()
+              .width('100%')
+              .height('100%')
+              .backgroundColor('#000000')
+          }
+        }
+
+        // 底部控件条：静音 + 当前时间 + 进度条 + 总时长
+        if (this.videoReady) {
+          Row({ space: 8 }) {
+            Row() {
+              SymbolGlyph(this.videoMuted
+                ? $r('sys.symbol.speaker_slash')
+                : $r('sys.symbol.speaker_wave_3'))
+                .fontSize(15)
+                .fontColor([Color.White])
+            }
+            .width(28)
+            .height(28)
+            .justifyContent(FlexAlign.Center)
+            .backgroundColor('#59000000')
+            .borderRadius(14)
+            .onTouch((e: TouchEvent) => {
+              this.onMuteTouch(e);
+            })
+            .onClick(() => {
+              this.videoMuted = !this.videoMuted;
+            })
+
+            Text(this.formatSec(this.videoCurSec))
+              .fontSize(11)
+              .fontColor(Color.White)
+
+            Slider({
+              value: this.videoCurSec,
+              min: 0,
+              max: this.videoDurSec > 0 ? this.videoDurSec : 1,
+              step: 0.1,
+              style: SliderStyle.OutSet
+            })
+              .layoutWeight(1)
+              .trackThickness(3)
+              .trackColor('#4DFFFFFF')
+              .selectedColor($r('app.color.brand_primary'))
+              .blockColor(Color.White)
+              .onChange((value: number, mode: SliderChangeMode) => {
+                this.onScrub(value, mode);
+              })
+
+            Text(this.formatSec(this.videoDurSec))
+              .fontSize(11)
+              .fontColor(Color.White)
+          }
+          .width('100%')
+          .padding({ left: 10, right: 14, top: 8, bottom: 8 })
+          .alignItems(VerticalAlign.Center)
+          .backgroundColor('#66000000')
+        }
+      }
+      .width(this.videoBox().w)
+      .height(this.videoBox().h)
+      .borderRadius(Radius.sm)
+      .clip(true)
+      .backgroundColor('#000000')
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Center)
+  }
+
   @Builder
   HeaderCard() {
     Column({ space: 10 }) {
@@ -304,30 +598,60 @@ export struct PostDetailPage {
         .fontWeight(FontWeight.Bold)
         .fontColor($r('app.color.text_primary'))
         .width('100%')
-      Row({ space: 8 }) {
-        if (this.detail.forumName.length > 0) {
-          Text(this.detail.forumName)
-            .fontSize(11)
-            .fontColor($r('app.color.brand_primary'))
-            .maxLines(1)
+      Row({ space: 10 }) {
+        if (this.detail.authorHeader.length > 0) {
+          ImageKnifeComponent({
+            imageKnifeOption: {
+              loadSrc: this.avatarUrl(this.detail.authorHeader),
+              objectFit: ImageFit.Cover,
+              border: { radius: 18 }
+            }
+          })
+            .width(36)
+            .height(36)
+            .onClick(() => {
+              this.openUserSpace(this.detail.authorPuid);
+            })
         }
-        Text(this.detail.authorName)
-          .fontSize(12)
-          .fontColor($r('app.color.text_secondary'))
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .layoutWeight(1)
+        Column({ space: 4 }) {
+          Row({ space: 8 }) {
+            if (this.detail.forumName.length > 0) {
+              Text(this.detail.forumName)
+                .fontSize(11)
+                .fontColor($r('app.color.brand_primary'))
+                .maxLines(1)
+            }
+            Text(this.detail.authorName)
+              .fontSize(12)
+              .fontColor($r('app.color.text_secondary'))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .layoutWeight(1)
+          }
+          .width('100%')
+          .onClick(() => {
+            this.openUserSpace(this.detail.authorPuid);
+          })
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
         Text(`${compactCount(this.detail.hits)} 阅读`)
           .fontSize(11)
           .fontColor($r('app.color.text_tertiary'))
       }
       .width('100%')
+      .alignItems(VerticalAlign.Center)
 
       Text(this.contentText)
         .fontSize(16)
         .lineHeight(26)
         .fontColor($r('app.color.text_primary'))
         .width('100%')
+
+      // 视频帖：正文下方展示播放区（PC 站详情提供 video/videoCover）
+      if (this.detail.hasVideo && this.detail.videoUrl.length > 0) {
+        this.VideoCard()
+      }
 
       ForEach(this.detail.contentImages, (img: string, idx: number) => {
         Image(thumbUrl(img, 720))
@@ -364,26 +688,7 @@ export struct PostDetailPage {
   @Builder
   SubReplyRow(sub: SubReplyItem) {
     Column({ space: 4 }) {
-      Row({ space: 6 }) {
-        Text(sub.userName)
-          .fontSize(12)
-          .fontWeight(FontWeight.Medium)
-          .fontColor($r('app.color.text_secondary'))
-          .maxLines(1)
-        if (sub.isLz) {
-          Text('楼主')
-            .fontSize(10)
-            .fontColor($r('app.color.brand_primary'))
-            .padding({ left: 4, right: 4 })
-            .border({ width: 1, color: $r('app.color.brand_primary') })
-            .borderRadius(3)
-        }
-        Blank()
-        Text(sub.createDt)
-          .fontSize(10)
-          .fontColor($r('app.color.text_tertiary'))
-      }
-      .width('100%')
+      this.ReplyAuthorRow(sub.puid, sub.userHeader, sub.userName, sub.isLz, sub.createDt)
 
       Text(sub.content)
         .fontSize(14)
@@ -415,16 +720,42 @@ export struct PostDetailPage {
     .borderRadius(Radius.sm)
   }
 
+  /** 评论作者行：头像（可点）+ 昵称（可点）+ 楼主标 + 右侧时间 */
   @Builder
-  ReplyCard(item: ReplyItem) {
-    Column({ space: 6 }) {
+  ReplyAuthorRow(puid: string, userHeader: string, userName: string, isLz: boolean, meta: string) {
+    Row({ space: 8 }) {
+      if (userHeader.length > 0) {
+        ImageKnifeComponent({
+          imageKnifeOption: {
+            loadSrc: this.avatarUrl(userHeader),
+            objectFit: ImageFit.Cover,
+            border: { radius: 14 }
+          }
+        })
+          .width(28)
+          .height(28)
+          .onClick(() => {
+            this.openUserSpace(puid);
+          })
+      } else {
+        // 无头像兜底占位，保证昵称左侧留白一致（点击同样可进主页）
+        Column()
+          .width(28)
+          .height(28)
+          .borderRadius(14)
+          .backgroundColor($r('app.color.tag_bg'))
+          .onClick(() => {
+            this.openUserSpace(puid);
+          })
+      }
       Row({ space: 6 }) {
-        Text(item.userName)
+        Text(userName)
           .fontSize(12)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.text_secondary'))
           .maxLines(1)
-        if (item.isLz) {
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+        if (isLz) {
           Text('楼主')
             .fontSize(10)
             .fontColor($r('app.color.brand_primary'))
@@ -432,12 +763,32 @@ export struct PostDetailPage {
             .border({ width: 1, color: $r('app.color.brand_primary') })
             .borderRadius(3)
         }
-        Blank()
-        Text(item.location.length > 0 ? `${item.location} · ${item.createDt}` : item.createDt)
+      }
+      .layoutWeight(1)
+      .onClick(() => {
+        this.openUserSpace(puid);
+      })
+      if (meta.length > 0) {
+        Text(meta)
           .fontSize(11)
           .fontColor($r('app.color.text_tertiary'))
+          .maxLines(1)
       }
-      .width('100%')
+    }
+    .width('100%')
+    .alignItems(VerticalAlign.Center)
+  }
+
+  @Builder
+  ReplyCard(item: ReplyItem) {
+    Column({ space: 6 }) {
+      this.ReplyAuthorRow(
+        item.puid,
+        item.userHeader,
+        item.userName,
+        item.isLz,
+        item.location.length > 0 ? `${item.location} · ${item.createDt}` : item.createDt)
+
 
       Text(item.content)
         .fontSize(15)
@@ -652,6 +1003,19 @@ export struct PostDetailPage {
       }
     }
     .hideTitleBar(true)
+    .onHidden(() => {
+      // 离开页面（进入子页/切后台）：暂停视频避免后台偷跑流量，返回时按原状态续播
+      if (this.detail.hasVideo && this.detail.videoUrl.length > 0) {
+        this.resumeOnShow = this.videoPlaying;
+        this.videoController.pause();
+      }
+    })
+    .onShown(() => {
+      if (this.resumeOnShow) {
+        this.resumeOnShow = false;
+        this.videoController.start();
+      }
+    })
     .backgroundColor($r('app.color.bg_page'))
   }
 }

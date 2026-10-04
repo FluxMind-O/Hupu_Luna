@@ -9,16 +9,23 @@ import { common } from '@kit.AbilityKit';
 const STORE_NAME: string = 'hupluna_settings';
 const KEY_MY_TOPICS: string = 'my_topic_ids';
 
-/** 官方社区页形态：左侧分类导航 + 右侧 3 列分区网格 + "我的"收藏区块 */
+/** 官方社区页形态：左侧分类导航 + 右侧分区区块长列表（滚动联动左侧选中态）+ "我的"收藏区块 */
 @Component
 export struct CommunityPage {
   @Consume('pageStack') pageStack: NavPathStack;
   @State categories: ZoneCategory[] = [];
   @State state: LoadState = LoadState.Loading;
-  @State activeIndex: number = 0;
+  @State activeIndex: number = -1;
   @State myTopics: ZoneTopic[] = [];
+  @State searchMode: boolean = false;
+  @State searchKeyword: string = '';
+  @State searchResults: ZoneTopic[] = [];
   @StorageLink('topAvoidPx') topAvoidPx: number = 0;
   private ctx: common.Context | null = null;
+  private rightScroller: Scroller = new Scroller();
+  private leftScroller: Scroller = new Scroller();
+  private suppressSync: boolean = false;
+  private leftManual: boolean = false;
 
   aboutToAppear(): void {
     this.ctx = this.getUIContext().getHostContext() as common.Context;
@@ -27,6 +34,23 @@ export struct CommunityPage {
 
   private getCtx(): common.Context {
     return this.getUIContext().getHostContext() as common.Context;
+  }
+
+  /** 专区搜索：全部分区按关键词过滤 */
+  private filterTopics(kw: string): ZoneTopic[] {
+    const k: string = kw.trim().toLowerCase();
+    if (k.length === 0) {
+      return [];
+    }
+    const list: ZoneTopic[] = [];
+    for (const cat of this.categories) {
+      for (const t of cat.topics) {
+        if (t.topicName.toLowerCase().indexOf(k) >= 0) {
+          list.push(t);
+        }
+      }
+    }
+    return list;
   }
 
   private async load(): Promise<void> {
@@ -99,6 +123,111 @@ export struct CommunityPage {
     }
   }
 
+  /** 右侧滚动 → 联动左侧选中态（-1=我的，其余=分类下标；检查相邻边界 + 末 section 完全入视口） */
+  private syncActiveFromScroll(): void {
+    if (this.suppressSync || this.categories.length === 0) {
+      return;
+    }
+    try {
+      const ui = this.getUIContext();
+      const len: number = this.categories.length;
+      const idx: number = this.activeIndex;
+      const cur: number = idx >= 0 ? idx : 0;
+      const area = ui.getComponentUtils().getRectangleById('zone_scroll_area');
+      const areaTop: number = area.windowOffset.y;
+      const last = ui.getComponentUtils().getRectangleById('zone_sec_' + (len - 1));
+      if (last.windowOffset.y + last.size.height <= area.windowOffset.y + area.size.height && cur < len - 1) {
+        this.setActive(len - 1);
+        return;
+      }
+      const curTop = ui.getComponentUtils().getRectangleById('zone_sec_' + cur).windowOffset.y;
+      if (curTop > areaTop + 2) {
+        this.setActive(cur > 0 ? cur - 1 : -1);
+        return;
+      }
+      if (idx < 0) {
+        this.setActive(0);
+        return;
+      }
+      if (cur + 1 < len) {
+        const nextTop = ui.getComponentUtils().getRectangleById('zone_sec_' + (cur + 1)).windowOffset.y;
+        if (nextTop <= areaTop + 2) {
+          this.setActive(cur + 1);
+        }
+      }
+    } catch (e) {
+    }
+  }
+
+  /** 选中态变更（-1=我的）+ 左侧导航滚动到可见 */
+  private setActive(i: number): void {
+    if (this.activeIndex === i) {
+      return;
+    }
+    this.activeIndex = i;
+    this.ensureActiveVisible();
+  }
+
+  /** 左侧导航自动滚动让选中项居中可见（用户手动滑动中不干预） */
+  private ensureActiveVisible(): void {
+    if (this.leftManual) {
+      return;
+    }
+    try {
+      const idx: number = this.activeIndex;
+      if (idx < -1 || idx >= this.categories.length) {
+        return;
+      }
+      const ui = this.getUIContext();
+      const id: string = idx === -1 ? 'zone_cat_my' : 'zone_cat_' + idx;
+      const rect = ui.getComponentUtils().getRectangleById(id);
+      const area = ui.getComponentUtils().getRectangleById('zone_left_area');
+      const areaTop: number = area.windowOffset.y;
+      const areaBottom: number = area.windowOffset.y + area.size.height;
+      const top: number = rect.windowOffset.y;
+      const bottom: number = top + rect.size.height;
+      if (top >= areaTop && bottom <= areaBottom) {
+        return;
+      }
+      const cur = this.leftScroller.currentOffset().yOffset;
+      const target: number = cur + (top + rect.size.height / 2 - (areaTop + area.size.height / 2));
+      this.leftScroller.scrollTo({
+        xOffset: 0,
+        yOffset: Math.max(0, target),
+        animation: { duration: 200, curve: Curve.EaseOut }
+      });
+    } catch (e) {
+    }
+  }
+
+  /** 点击左侧栏目（-1=我的）→ 右侧滚动定位到对应区块 */
+  private scrollToSection(i: number): void {
+    const len: number = this.categories.length;
+    if (i < -1 || i >= len) {
+      return;
+    }
+    this.setActive(i);
+    this.suppressSync = true;
+    try {
+      const ui = this.getUIContext();
+      const id: string = i === -1 ? 'zone_sec_my' : 'zone_sec_' + i;
+      const rect = ui.getComponentUtils().getRectangleById(id);
+      const areaTop = ui.getComponentUtils().getRectangleById('zone_scroll_area').windowOffset.y;
+      const cur = this.rightScroller.currentOffset().yOffset;
+      const target: number = cur + (rect.windowOffset.y - areaTop);
+      this.rightScroller.scrollTo({
+        xOffset: 0,
+        yOffset: Math.max(0, target),
+        animation: { duration: 250, curve: Curve.EaseOut }
+      });
+    } catch (e) {
+    }
+    setTimeout(() => {
+      this.suppressSync = false;
+    }, 300);
+  }
+
+
   private toast(msg: string): void {
     try {
       this.getUIContext().getPromptAction().showToast({ message: msg });
@@ -106,12 +235,6 @@ export struct CommunityPage {
     }
   }
 
-  private currentTopics(): ZoneTopic[] {
-    if (this.activeIndex < 0 || this.activeIndex >= this.categories.length) {
-      return [];
-    }
-    return this.categories[this.activeIndex].topics;
-  }
 
   /** 热度文案：146.4万 / 2.9万 / 3.7万 */
   private heatText(count: string): string {
@@ -134,22 +257,22 @@ export struct CommunityPage {
           imageKnifeOption: {
             loadSrc: topic.topicLogo,
             objectFit: ImageFit.Cover,
-            border: { radius: 12 }
+            border: { radius: 10 }
           }
         })
-          .width(56)
-          .height(56)
+          .width(48)
+          .height(48)
         if (this.myTopics.some((t: ZoneTopic) => t.topicId === topic.topicId)) {
           Text('我的')
             .fontSize(9)
             .fontColor(Color.White)
             .backgroundColor('#B3000000')
             .padding({ left: 5, right: 5, top: 1, bottom: 1 })
-            .borderRadius({ bottomLeft: 12, bottomRight: 12 })
+            .borderRadius({ bottomLeft: 10, bottomRight: 10 })
         }
       }
-      .width(56)
-      .height(56)
+      .width(48)
+      .height(48)
 
       Text(topic.topicName)
         .fontSize(12)
@@ -182,24 +305,137 @@ export struct CommunityPage {
   build() {
     Column() {
       Column() {
-      Row() {
-        Text('社区')
-          .fontSize(20)
-          .fontWeight(FontWeight.Bold)
-          .fontColor($r('app.color.text_primary'))
+      if (this.searchMode) {
+        Row({ space: 10 }) {
+          TextInput({ text: this.searchKeyword, placeholder: '搜索专区' })
+            .layoutWeight(1)
+            .height(36)
+            .fontSize(13)
+            .fontColor($r('app.color.text_primary'))
+            .placeholderColor($r('app.color.text_tertiary'))
+            .backgroundColor($r('app.color.tag_bg'))
+            .borderRadius(18)
+            .onChange((v: string) => {
+              this.searchKeyword = v;
+              this.searchResults = this.filterTopics(v);
+            })
+          Text('取消')
+            .fontSize(13)
+            .fontColor($r('app.color.text_secondary'))
+            .onClick(() => {
+              this.searchMode = false;
+              this.searchKeyword = '';
+              this.searchResults = [];
+            })
+        }
+        .width('100%')
+        .padding({ left: Spacing.lg, right: Spacing.lg, top: 8, bottom: 6 })
+      } else {
+        Row({ space: 8 }) {
+          Text('Hupu Luna')
+            .fontSize(16)
+            .fontWeight(FontWeight.Bold)
+            .fontColor($r('app.color.brand_primary'))
+            .maxLines(1)
+          Blank()
+          Row() {
+            Text('搜索专区')
+              .fontSize(12)
+              .fontColor($r('app.color.text_tertiary'))
+              .maxLines(1)
+              .width('100%')
+          }
+          .width(160)
+          .height(34)
+          .padding({ left: 12, right: 12 })
+          .backgroundColor($r('app.color.tag_bg'))
+          .borderRadius(17)
+          .onClick(() => {
+            this.searchMode = true;
+          })
+
+        }
+        .width('100%')
+        .padding({ left: Spacing.lg, right: Spacing.lg, top: 10, bottom: 6 })
       }
-      .width('100%')
-      .padding({ left: Spacing.lg, right: Spacing.lg, top: 10, bottom: 6 })
       }
       .width('100%')
       .padding({ top: px2vp(this.topAvoidPx) })
       .backgroundColor($r('app.color.bg_page'))
 
-      if (this.state === LoadState.Ready) {
+      if (this.searchMode) {
+        Scroll() {
+          Column({ space: 10 }) {
+            if (this.searchKeyword.trim().length === 0) {
+              Text('输入关键词搜索分区')
+                .fontSize(13)
+                .fontColor($r('app.color.text_tertiary'))
+                .width('100%')
+                .textAlign(TextAlign.Center)
+                .padding({ top: 40, bottom: 40 })
+            } else if (this.searchResults.length === 0) {
+              Text('未找到相关分区')
+                .fontSize(13)
+                .fontColor($r('app.color.text_tertiary'))
+                .width('100%')
+                .textAlign(TextAlign.Center)
+                .padding({ top: 40, bottom: 40 })
+            } else {
+              Text(`${this.searchResults.length} 个匹配分区`)
+                .fontSize(11)
+                .fontColor($r('app.color.text_tertiary'))
+                .width('100%')
+              Grid() {
+                ForEach(this.searchResults, (t: ZoneTopic) => {
+                  GridItem() {
+                    this.TopicCell(t)
+                  }
+                }, (t: ZoneTopic) => `srch_${t.topicId}`)
+              }
+              .columnsTemplate('1fr 1fr 1fr')
+              .columnsGap(6)
+              .rowsGap(6)
+              .width('100%')
+              .height(Math.ceil(this.searchResults.length / 3) * 110)
+            }
+          }
+          .padding({ left: 10, right: 10, bottom: 20 })
+          .width('100%')
+        }
+        .layoutWeight(1)
+        .width('100%')
+        .scrollBar(BarState.Off)
+      } else if (this.state === LoadState.Ready) {
         Row() {
-          // 左侧分类导航
-          Scroll() {
+          // 左侧分类导航（含"我的"入口，可上下滑动，联动时自动滚到选中项）
+          Scroll(this.leftScroller) {
             Column() {
+              Row() {
+                if (this.activeIndex === -1) {
+                  Column()
+                    .width(3)
+                    .height(18)
+                    .backgroundColor($r('app.color.brand_primary'))
+                    .borderRadius(2)
+                    .margin({ right: 6 })
+                } else {
+                  Column().width(3).height(18).margin({ right: 6 })
+                }
+                Text('我的')
+                  .fontSize(13)
+                  .fontWeight(this.activeIndex === -1 ? FontWeight.Bold : FontWeight.Normal)
+                  .fontColor(this.activeIndex === -1 ? $r('app.color.brand_primary') : $r('app.color.text_secondary'))
+                  .maxLines(1)
+              }
+              .width('100%')
+              .height(44)
+              .padding({ left: 8, right: 4 })
+              .alignItems(VerticalAlign.Center)
+              .id('zone_cat_my')
+              .onClick(() => {
+                this.scrollToSection(-1);
+              })
+
               ForEach(this.categories, (cat: ZoneCategory, index: number) => {
                 Row() {
                   if (index === this.activeIndex) {
@@ -222,91 +458,113 @@ export struct CommunityPage {
                 .height(44)
                 .padding({ left: 8, right: 4 })
                 .alignItems(VerticalAlign.Center)
+                .id('zone_cat_' + index)
                 .onClick(() => {
-                  this.activeIndex = index;
+                  this.scrollToSection(index);
                 })
               }, (cat: ZoneCategory, index: number) => `${cat.categoryId}_${index}`)
             }
             .width('100%')
           }
+          .id('zone_left_area')
           .scrollBar(BarState.Off)
           .width(96)
           .height('100%')
           .backgroundColor($r('app.color.bg_page'))
+          .onScrollStart(() => {
+            this.leftManual = true;
+          })
+          .onScrollStop(() => {
+            this.leftManual = false;
+          })
 
-          // 右侧内容
+          // 右侧内容：全部分区区块依序拼接，上下滚动联动左侧选中态
           Column() {
-            Scroll() {
+            Scroll(this.rightScroller) {
               Column({ space: 10 }) {
-                // 我的分区
-                Row() {
-                  Text('我的')
-                    .fontSize(15)
-                    .fontWeight(FontWeight.Bold)
-                    .fontColor($r('app.color.text_primary'))
-                  Blank()
-                  Text('长按卡片可添加/移除')
-                    .fontSize(10)
-                    .fontColor($r('app.color.text_tertiary'))
-                }
-                .width('100%')
-
-                if (this.myTopics.length > 0) {
-                  Grid() {
-                    ForEach(this.myTopics, (t: ZoneTopic) => {
-                      GridItem() {
-                        this.TopicCell(t)
-                      }
-                    }, (t: ZoneTopic) => `my_${t.topicId}`)
+                // 我的分区区块
+                Column({ space: 10 }) {
+                  Row() {
+                    Text('我的')
+                      .fontSize(15)
+                      .fontWeight(FontWeight.Bold)
+                      .fontColor($r('app.color.text_primary'))
+                    Blank()
+                    Text('长按卡片可添加/移除')
+                      .fontSize(10)
+                      .fontColor($r('app.color.text_tertiary'))
                   }
-                  .columnsTemplate('1fr 1fr 1fr')
-                  .columnsGap(6)
-                  .rowsGap(6)
                   .width('100%')
-                  .height(Math.ceil(this.myTopics.length / 3) * 106 + 12)
-                } else {
-                  Text('长按下方分区卡片，添加到"我的"')
-                    .fontSize(11)
-                    .fontColor($r('app.color.text_tertiary'))
-                    .width('100%')
-                    .textAlign(TextAlign.Center)
-                    .padding(14)
-                    .backgroundColor($r('app.color.bg_card'))
-                    .borderRadius(Radius.md)
-                }
 
-                // 推荐网格（当前分类全部分区）
-                Row() {
-                  Text(this.categories[this.activeIndex].name)
-                    .fontSize(15)
-                    .fontWeight(FontWeight.Bold)
-                    .fontColor($r('app.color.text_primary'))
-                  Blank()
-                  Text(`${this.currentTopics().length} 个分区`)
-                    .fontSize(10)
-                    .fontColor($r('app.color.text_tertiary'))
-                }
-                .width('100%')
-
-                Grid() {
-                  ForEach(this.currentTopics(), (t: ZoneTopic) => {
-                    GridItem() {
-                      this.TopicCell(t)
+                  if (this.myTopics.length > 0) {
+                    Grid() {
+                      ForEach(this.myTopics, (t: ZoneTopic) => {
+                        GridItem() {
+                          this.TopicCell(t)
+                        }
+                      }, (t: ZoneTopic) => `my_${t.topicId}`)
                     }
-                  }, (t: ZoneTopic) => `rec_${t.topicId}`)
+                    .columnsTemplate('1fr 1fr 1fr')
+                    .columnsGap(6)
+                    .rowsGap(6)
+                    .width('100%')
+                    .height(Math.ceil(this.myTopics.length / 3) * 110)
+                  } else {
+                    Text('长按下方分区卡片，添加到"我的"')
+                      .fontSize(11)
+                      .fontColor($r('app.color.text_tertiary'))
+                      .width('100%')
+                      .textAlign(TextAlign.Center)
+                      .padding(14)
+                      .backgroundColor($r('app.color.bg_card'))
+                      .borderRadius(Radius.md)
+                  }
                 }
-                .columnsTemplate('1fr 1fr 1fr')
-                .columnsGap(6)
-                .rowsGap(6)
+                .id('zone_sec_my')
                 .width('100%')
+
+                // 各分类分区区块（依序拼接）
+                ForEach(this.categories, (cat: ZoneCategory, index: number) => {
+                  Column({ space: 10 }) {
+                    Row() {
+                      Text(cat.name)
+                        .fontSize(15)
+                        .fontWeight(FontWeight.Bold)
+                        .fontColor($r('app.color.text_primary'))
+                      Blank()
+                      Text(`${cat.topics.length} 个分区`)
+                        .fontSize(10)
+                        .fontColor($r('app.color.text_tertiary'))
+                    }
+                    .width('100%')
+
+                    Grid() {
+                      ForEach(cat.topics, (t: ZoneTopic) => {
+                        GridItem() {
+                          this.TopicCell(t)
+                        }
+                      }, (t: ZoneTopic) => `sec${index}_${t.topicId}`)
+                    }
+                    .columnsTemplate('1fr 1fr 1fr')
+                    .columnsGap(6)
+                    .rowsGap(6)
+                    .width('100%')
+                    .height(Math.ceil(cat.topics.length / 3) * 110)
+                  }
+                  .id('zone_sec_' + index)
+                  .width('100%')
+                }, (cat: ZoneCategory, index: number) => `${cat.categoryId}_${index}`)
               }
               .padding({ left: 10, right: 10, bottom: 20 })
               .width('100%')
             }
+            .id('zone_scroll_area')
             .scrollBar(BarState.Off)
             .layoutWeight(1)
             .width('100%')
-            .backgroundColor($r('app.color.bg_page'))
+            .onDidScroll(() => {
+              this.syncActiveFromScroll();
+            })
           }
           .layoutWeight(1)
           .height('100%')

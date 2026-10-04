@@ -166,7 +166,7 @@ export struct ProfilePage {
       }
     }
     .width('100%')
-    .padding({ left: Spacing.lg, right: Spacing.lg, top: 18, bottom: 18 })
+    .padding({ left: Spacing.lg, right: Spacing.lg, top: 4, bottom: 8 })
     .backgroundColor($r('app.color.bg_card'))
     .borderRadius(14)
   }
@@ -180,7 +180,7 @@ export struct ProfilePage {
       this.StatCell(this.profileLoading ? '—' : (this.myProfile.level.replace(/[^0-9]/g, '') || '—'), '等级')
     }
     .width('100%')
-    .padding({ top: 14, bottom: 14 })
+    .padding({ top: 8, bottom: 8 })
     .backgroundColor($r('app.color.bg_card'))
     .borderRadius(14)
   }
@@ -310,14 +310,14 @@ export struct ProfilePage {
           })
       }
       .width('100%')
-      .padding({ left: Spacing.lg, right: Spacing.lg, top: 10, bottom: 8 })
+      .padding({ left: Spacing.lg, right: Spacing.lg, top: 2, bottom: 0 })
       }
       .width('100%')
       .padding({ top: px2vp(this.topAvoidPx) })
       .backgroundColor($r('app.color.bg_page'))
 
       Scroll() {
-        Column({ space: 10 }) {
+        Column({ space: 8 }) {
           this.AccountCard()
           if (this.loginState === 1) {
             this.StatLine()
@@ -362,12 +362,14 @@ export struct ProfilePage {
             .textAlign(TextAlign.Center)
             .padding({ top: 10, bottom: 20 })
         }
-        .padding({ left: Spacing.lg, right: Spacing.lg, bottom: 10 })
+        .padding({ left: Spacing.lg, right: Spacing.lg, top: 26, bottom: 10 })
         .width('100%')
       }
       .layoutWeight(1)
       .width('100%')
       .scrollBar(BarState.Off)
+      // 内容不足一屏时 Scroll 默认居中，显式顶对齐避免"我的"卡片悬在屏幕中部
+      .align(Alignment.Top)
     }
     .width('100%')
     .height('100%')

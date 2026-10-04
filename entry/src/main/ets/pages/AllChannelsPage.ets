@@ -71,6 +71,8 @@ export struct AllChannelsPage {
 
   private jump(id: string): void {
     AppStorage.setOrCreate<string>('activeChannelId', id);
+    // 直连持久化：HomePage 若未挂载（首次进入该页）@Watch 不触发，避免丢失末次栏目
+    ChannelStore.saveLast(this.getCtx(), id);
     this.pageStack.pop();
   }
 

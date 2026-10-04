@@ -13,3 +13,9 @@
 /probe
 **/.preview
 /generated-images
+
+# 构建产物
+*.hap
+
+# 调试用抓包样例
+/ws1.json

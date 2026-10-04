@@ -14,10 +14,29 @@ export class ThreadListItem {
   replies: number = 0;
   recommendCount: number = 0;
   topicName: string = '';
+  /** 所属话题 id（官方号发帖列表按此过滤到目标频道） */
+  topicId: number = 0;
+  /** 板块 fid（搜索结果按此过滤到目标频道） */
+  fid: number = 0;
   topicIcon: string = '';
   coverUrl: string = '';
   isVideo: boolean = false;
   videoDuration: string = '';
+  /** 视频直连播放地址（videoThread 时由 video.url 提供，带时效 auth_key） */
+  videoUrl: string = '';
+  /** 封面宽高（按真实比例渲染单图/视频区） */
+  coverWidth: number = 0;
+  coverHeight: number = 0;
+  /** 分享数 */
+  shareNum: number = 0;
+  /** 浏览数（官方号发文列表提供） */
+  visits: number = 0;
+  /** 视频播放量（视频帖的"浏览"口径） */
+  playNum: number = 0;
+  /** 神回复（亮评）：内容 / 作者 / 亮数 */
+  lightReplyContent: string = '';
+  lightReplyUser: string = '';
+  lightReplyCount: number = 0;
 }
 
 /** 帖子流响应包 */
@@ -38,10 +57,21 @@ export class ThreadDetail {
   contentImages: string[] = [];
   authorName: string = '';
   authorHeader: string = '';
+  /** 楼主 puid（点击头像进楼主主页） */
+  authorPuid: string = '';
   forumName: string = '';
   hits: number = 0;
   replies: number = 0;
   lights: number = 0;
+  /** 是否视频帖（仅 PC 站详情页提供；m 站 API 无此字段） */
+  hasVideo: boolean = false;
+  /** 视频直连播放地址（PC 站 video 字段，带时效 auth_key） */
+  videoUrl: string = '';
+  /** 视频封面 */
+  videoCover: string = '';
+  /** 视频原始宽高（按比例渲染用） */
+  videoWidth: number = 0;
+  videoHeight: number = 0;
 }
 
 /** 回复（楼层） */
@@ -318,6 +348,8 @@ export class HotRankItem {
 export class SubReplyItem {
   parentPid: string = '';
   pid: string = '';
+  /** 作者 puid（点击头像进主页用） */
+  puid: string = '';
   userName: string = '';
   userHeader: string = '';
   content: string = '';
@@ -325,4 +357,67 @@ export class SubReplyItem {
   light: number = 0;
   createDt: string = '';
   isLz: boolean = false;
+}
+
+/** 专区信息（PC 话题页头部解析） */
+export class TopicInfo {
+  topicId: number = 0;
+  /** 专区名（如 NBA2KOL2） */
+  name: string = '';
+  /** 话题介绍 */
+  desc: string = '';
+  /** 话题热度（如 3.4w） */
+  heat: string = '';
+  /** 版主昵称列表 */
+  moderators: string[] = [];
+  /**
+   * 头部图（PC 页 intro 的 background-image）。
+   * 注意：该图与专区头像同源（方形 LOGO，约 500x500），
+   * 官方 App 亦用它作头部背景——放大铺满 + 暗化蒙层即可适配。
+   */
+  bannerUrl: string = '';
+}
+
+/** 用户主页档案（m.hupu.com/user/{puid} 公开页） */
+export class UserProfile {
+  puid: string = '';
+  nickname: string = '';
+  header: string = '';
+  /** 论坛等级数字 */
+  level: number = 0;
+  /** 等级文案（如 Lv.3） */
+  levelDesc: string = '';
+  /** 声望值 */
+  reputation: number = 0;
+  /** 被点亮数 */
+  beLight: number = 0;
+  /** 被关注数（粉丝） */
+  beFollow: number = 0;
+  /** 关注数 */
+  follow: number = 0;
+  /** 被推荐数 */
+  beRecommend: number = 0;
+  /** 是否本人（接口 is_self 字段） */
+  isSelf: boolean = false;
+}
+
+/** 用户主页条目（主题帖 / 回帖统一结构） */
+export class UserPostItem {
+  tid: string = '';
+  /** 主题帖标题；回帖时为空 */
+  title: string = '';
+  /** 回帖正文；主题帖时为空 */
+  content: string = '';
+  topicName: string = '';
+  lights: number = 0;
+  replies: number = 0;
+  visits: number = 0;
+  time: string = '';
+}
+
+/** 用户主页数据包 */
+export class UserSpaceData {
+  profile: UserProfile = new UserProfile();
+  threads: UserPostItem[] = [];
+  replies: UserPostItem[] = [];
 }

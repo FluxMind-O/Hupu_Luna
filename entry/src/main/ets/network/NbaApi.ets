@@ -56,7 +56,10 @@ interface NbaRecommendMatchDto {
 }
 
 interface NbaPagePropsDto {
+  /** NBA / CBA 页的资讯字段 */
   newsData?: NbaNewsDto[];
+  /** 足球页的资讯字段（与 newsData 同构，仅键名不同） */
+  news?: NbaNewsDto[];
   recommendMatch?: NbaRecommendMatchDto;
 }
 
@@ -272,10 +275,30 @@ interface ScoreApiRespDto {
 export class NbaApi {
   /** NBA 资讯流 */
   static async getNews(): Promise<NbaNewsItem[]> {
-    const html: string = await HttpManager.get(`${BASE}/nba`);
+    return NbaApi.getLeagueNews('nba');
+  }
+
+  /**
+   * 联盟官方资讯流（m 站频道页内嵌数据）。
+   * source：'nba' → /nba（newsData）/ 'cba' → /cba（newsData）/ 'soccer' → /soccer（news）。
+   * 说明：m 站仅有 nba / cba / soccer 三个官方资讯页，
+   * 其余话题（乒乓球、网球、影视等）无官方资讯源，只能走帖子流。
+   * 注：置顶类条目 type=LINK 且 tid 为 null（App 内深链，本应用不可跳转），
+   * 这类条目仍展示标题，点击无响应；普通条目 tid 有效可进帖子详情。
+   */
+  static async getLeagueNews(source: string): Promise<NbaNewsItem[]> {
+    let path: string = '/nba';
+    if (source === 'cba') {
+      path = '/cba';
+    } else if (source === 'soccer') {
+      path = '/soccer';
+    }
+    const html: string = await HttpManager.get(`${BASE}${path}`);
     const json: string = NbaApi.extractNextData(html);
     const resp = JSON.parse(json) as NbaRespDto;
-    const list = resp.props?.pageProps?.newsData;
+    const pp = resp.props?.pageProps;
+    // NBA/CBA 用 newsData，足球页用 news（同构异构名）
+    const list = pp?.newsData ?? pp?.news;
     const result: NbaNewsItem[] = [];
     if (!list) {
       throw new Error('资讯数据为空');

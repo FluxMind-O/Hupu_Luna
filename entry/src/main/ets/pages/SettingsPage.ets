@@ -1,5 +1,6 @@
 import { ImageKnife } from '@ohos/imageknife';
 import { bundleManager, common } from '@kit.AbilityKit';
+import { pasteboard } from '@kit.BasicServicesKit';
 import { Spacing, Radius, RouteName } from '../common/Theme';
 import { FavStore } from '../database/FavStore';
 import { ChannelStore } from '../database/ChannelStore';
@@ -136,6 +137,39 @@ export struct SettingsPage {
       this.toast('频道已恢复默认');
     } catch (e) {
       this.toast('操作失败');
+    }
+  }
+
+  /** 导出收藏到剪贴板（JSON） */
+  private async exportFavs(): Promise<void> {
+    try {
+      const json: string = await FavStore.exportJson(this.getCtx());
+      const data: pasteboard.PasteData = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, json);
+      await pasteboard.getSystemPasteboard().setData(data);
+      this.toast('收藏已导出到剪贴板');
+    } catch (e) {
+      this.toast('导出失败，请重试');
+    }
+  }
+
+  /** 从剪贴板导入收藏（幂等合并） */
+  private async importFavs(): Promise<void> {
+    try {
+      const data: pasteboard.PasteData = await pasteboard.getSystemPasteboard().getData();
+      const text: string = data.getPrimaryText() ?? '';
+      if (text.trim().length === 0) {
+        this.toast('剪贴板为空');
+        return;
+      }
+      const count: number = await FavStore.importJson(this.getCtx(), text.trim());
+      if (count < 0) {
+        this.toast('剪贴板内容不是有效的收藏备份');
+        return;
+      }
+      AppStorage.setOrCreate<number>('favVersion', Date.now());
+      this.toast(`已导入 ${count} 条收藏`);
+    } catch (e) {
+      this.toast('导入失败，请重试');
     }
   }
 
@@ -397,6 +431,14 @@ export struct SettingsPage {
             Divider().color($r('app.color.divider'))
             this.RowItem('恢复默认频道', true, false, () => {
               this.resetChannels();
+            })
+            Divider().color($r('app.color.divider'))
+            this.RowItem('导出收藏（剪贴板）', false, false, () => {
+              this.exportFavs();
+            })
+            Divider().color($r('app.color.divider'))
+            this.RowItem('从剪贴板导入收藏', false, false, () => {
+              this.importFavs();
             })
           }
           .width('100%')

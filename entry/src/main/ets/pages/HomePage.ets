@@ -8,10 +8,20 @@ import { Spacing, FontSize, Radius, RouteName } from '../common/Theme';
 import { thumbUrl } from '../common/Utils';
 import { compactCount, formatHeat } from '../views/TagChip';
 import { ChannelDef, ChannelKind, ChannelCatalog } from '../common/Channels';
+import { OfficialAccounts } from '../common/OfficialAccounts';
 import { ChannelStore } from '../database/ChannelStore';
 import { CacheStore, CachedPayload } from '../database/CacheStore';
 import { ImageKnifeComponent } from '@ohos/imageknife';
 import { common } from '@kit.AbilityKit';
+import { display } from '@kit.ArkUI';
+import { hilog } from '@kit.PerformanceAnalysisKit';
+
+/**
+ * 频道缓存键前缀。
+ * 版本号用于隔断历史缓存：本次修复了"中国足球/国际足球资讯"频道数据源错配，
+ * 旧缓存中残留的错误内容（NBA 资讯）若继续命中会先于网络结果显示。
+ */
+const HOME_CACHE_PREFIX: string = 'home2/';
 
 /** 通用信息流行 */
 class FeedRow {
@@ -28,6 +38,26 @@ class FeedRow {
   videoDur: string = '';
   /** true = 官方大卡样式（仅推荐频道） */
   officialCard: boolean = false;
+  /** 视频直连播放地址（推荐流自动播放用） */
+  videoUrl: string = '';
+  /** 封面真实宽高（单图/视频区按比例定高） */
+  coverW: number = 0;
+  coverH: number = 0;
+  /** 官方大卡数据栏：回复 / 亮 / 分享 / 浏览（视频为播放量） */
+  replies: number = 0;
+  lights: number = 0;
+  shareNum: number = 0;
+  viewNum: number = 0;
+  /** 神回复（亮评） */
+  lightReplyContent: string = '';
+  lightReplyUser: string = '';
+  lightReplyCount: number = 0;
+}
+
+/** 媒体区尺寸（vp） */
+class MediaBox {
+  w: number = 0;
+  h: number = 0;
 }
 
 /** 频道顶部比赛条 */
@@ -48,6 +78,11 @@ class StripItem {
   done: boolean = false;
   timeText: string = '';
   pv: string = '';
+}
+
+/** 官方过滤频道的数据包 */
+class OfficialFeed {
+  rows: FeedRow[] = [];
 }
 
 /** 频道缓存快照（缓存优先渲染：先渲缓存再静默刷新） */
@@ -80,6 +115,24 @@ export struct HomePage {
   @State activeKind: string = '';
   @State contentAlpha: number = 1;
   @State enterOffsetX: number = 0;
+  /** 当前自动播放的视频帖 tid（推荐流；空=无） */
+  @State playingTid: string = '';
+  /** 达到自动播放可见阈值的视频帖（滚动停止后择一播放） */
+  private visibleVideos: string[] = [];
+  /** 列表滚动中（滚动期间不切换播放，防抖省流） */
+  private listScrolling: boolean = false;
+  /** 内容区宽度缓存（vp，惰性计算） */
+  private cachedContentW: number = 0;
+  /** 官方频道已展示的 tid（翻页捞历史时去重，跨请求保持） */
+  private officialSeen: Set<string> = new Set<string>();
+  /** 官方频道是否已回退到普通帖子流（回退后不再按官方过滤） */
+  private officialFallback: boolean = false;
+  /** 官方频道连续无收获页数（用于判定官方内容到底） */
+  private officialDryPages: number = 0;
+  /** 当前视频是否静音（默认静音，切换视频时复位） */
+  @State videoMuted: boolean = true;
+  /** 静音按钮按下标记：防止点击穿透触发卡片的"打开帖子" */
+  private mutePressed: boolean = false;
   private pageIndex: number = 0;
   private cursor: string = '';
   private loadingMore: boolean = false;
@@ -110,10 +163,19 @@ export struct HomePage {
   }
 
   private getCtx(): common.Context {
+    // 优先用 EntryAbility 存入的全局上下文（最可靠），失败再取 getHostContext
+    try {
+      const stored: Object | undefined = AppStorage.get<Object>('appContext');
+      if (stored) {
+        return stored as common.Context;
+      }
+    } catch (e) {
+    }
     return this.getUIContext().getHostContext() as common.Context;
   }
 
   private async initOnce(): Promise<void> {
+    // 频道列表：EntryAbility 已在首帧前写回 AppStorage；此处兜底处理冷启动读盘失败的情况
     let json: string = this.channelIdsJson;
     if (json.length === 0) {
       let ids: string[] = [];
@@ -128,16 +190,36 @@ export struct HomePage {
       json = JSON.stringify(ids);
       AppStorage.setOrCreate<string>('channelIdsJson', json);
     }
+    // 上次停留栏目：EntryAbility 已同步恢复；若仍为空则回落到频道列表首项
     if (this.activeChannelId.length === 0) {
       const ids2: string[] = JSON.parse(json) as string[];
-      const first: string = ids2.length > 0 ? ids2[0] : 'recommend';
+      const target: string = ids2.length > 0 ? ids2[0] : 'recommend';
       // 触发 onActiveChanged -> loadActive
-      AppStorage.setOrCreate<string>('activeChannelId', first);
+      AppStorage.setOrCreate<string>('activeChannelId', target);
     }
     this.rebuildChannels();
+    // 频道栏滚到选中项（恢复的栏目可能不在屏内；延迟等列表完成首次布局）
+    const activeIdx: number = this.indexOfChannel(this.activeChannelId);
+    if (activeIdx > 0) {
+      setTimeout(() => {
+        try {
+          this.channelScroller.scrollToIndex(activeIdx, false, ScrollAlign.CENTER);
+        } catch (e) {
+        }
+      }, 50);
+    }
     if (this.activeChannelId.length > 0) {
       this.loadActive(false);
     }
+  }
+
+  /** 栏目切换时持久化，供下次启动恢复（同步写入，防退出前异步未落盘） */
+  private saveLastChannel(id: string): void {
+    if (id.length === 0) {
+      return;
+    }
+    ChannelStore.saveLast(this.getCtx(), id);
+    hilog.info(0x0000, 'HupuLuna', 'saveLastChannel ok: %{public}s', id);
   }
 
   onChannelsChanged(): void {
@@ -147,6 +229,7 @@ export struct HomePage {
   onActiveChanged(): void {
     const isSwitch: boolean =
       this.lastLoadedChannelId.length > 0 && this.lastLoadedChannelId !== this.activeChannelId;
+    this.saveLastChannel(this.activeChannelId);
     this.loadActive(isSwitch);
   }
 
@@ -182,13 +265,24 @@ export struct HomePage {
   private mapThreads(items: ThreadListItem[], officialCard: boolean): FeedRow[] {
     const result: FeedRow[] = [];
     for (const t of items) {
-      const row: FeedRow = new FeedRow();
+      result.push(this.mapOne(t, officialCard));
+    }
+    return result;
+  }
+
+  /** 单条映射（loadMore 追加时复用） */
+  private mapOne(t: ThreadListItem, officialCard: boolean = false): FeedRow {
+    const row: FeedRow = new FeedRow();
+    {
       row.tid = t.tid;
       row.title = t.title;
       row.author = t.userName;
       row.tag = t.topicName;
       row.time = t.time;
-      row.meta = `${compactCount(t.replies)} 回复 · ${compactCount(t.recommendCount)} 亮`;
+      // 浏览量有值时补充展示（PC 话题流提供；m 站接口无此字段）
+      row.meta = t.visits > 0
+        ? `${compactCount(t.visits)} 浏览 · ${compactCount(t.replies)} 回复`
+        : `${compactCount(t.replies)} 回复 · ${compactCount(t.recommendCount)} 亮`;
       row.cover = t.coverUrl;
       row.userHeader = t.userHeader;
       for (const u of t.picUrls) {
@@ -196,18 +290,172 @@ export struct HomePage {
       }
       row.isVideo = t.isVideo;
       row.videoDur = t.videoDuration;
-      result.push(row);
+      row.videoUrl = t.videoUrl;
+      row.coverW = t.coverWidth;
+      row.coverH = t.coverHeight;
+      row.replies = t.replies;
+      row.lights = t.recommendCount;
+      row.shareNum = t.shareNum;
+      // 浏览数优先用 visits（官方号发文列表提供），视频帖回退到播放量
+      row.viewNum = t.visits > 0 ? t.visits : t.playNum;
+      row.lightReplyContent = t.lightReplyContent;
+      row.lightReplyUser = t.lightReplyUser;
+      row.lightReplyCount = t.lightReplyCount;
+      // 关键：官方大卡样式标记（此前漏赋值，导致推荐频道仍走紧凑卡）
+      row.officialCard = officialCard;
     }
-    return result;
+    return row;
   }
 
-  private mapNews(items: NbaNewsItem[]): FeedRow[] {
+  /** 列表底部文案（官方频道到底时说明原因，避免用户以为内容缺失） */
+  private footerText(): string {
+    const ch: ChannelDef = ChannelCatalog.find(this.activeChannelId);
+    if (!this.hasMore) {
+      if (ch.officialSources.length > 0 && !this.officialFallback) {
+        return '已无更多官方资讯';
+      }
+      return '已经到底了';
+    }
+    return ch.officialSources.length > 0 ? '上拉加载更多官方资讯' : '上拉加载更多';
+  }
+
+  /** 内容区宽度（vp）：屏幕宽 - 列表左右内边距，供媒体区按比例定高 */
+  private contentWidthVp(): number {
+    if (this.cachedContentW > 0) {
+      return this.cachedContentW;
+    }
+    let w: number = 328;
+    try {
+      const screenW: number = this.getUIContext().px2vp(display.getDefaultDisplaySync().width);
+      if (screenW > 0) {
+        w = screenW - Spacing.lg * 2;
+      }
+    } catch (e) {
+    }
+    this.cachedContentW = w;
+    return w;
+  }
+
+  /**
+   * 媒体区高度：按真实比例计算并限幅（对齐官方卡片尺寸）。
+   * 16:9 横屏视频 ≈ 184vp 完整显示；4:3、竖屏内容封顶 200vp（视频侧 Cover 裁切铺满，消除黑边）。
+   * 旧实现竖屏视频给到 340vp 且用 Contain，导致面积过大 + 左右黑边。
+   */
+  private mediaHeight(row: FeedRow): number {
+    const minH: number = 150;
+    const maxH: number = 200;
+    if (row.coverW <= 0 || row.coverH <= 0) {
+      return maxH;
+    }
+    const ratio: number = row.coverW / row.coverH;
+    if (ratio <= 0) {
+      return maxH;
+    }
+    const h: number = this.contentWidthVp() / ratio;
+    if (h < minH) {
+      return minH;
+    }
+    return h > maxH ? maxH : h;
+  }
+
+  /**
+   * 单图媒体区尺寸（对齐官方形制）：
+   * - 横图（宽高比 ≥ 1.2）：满宽，高度按比例限幅 150~200vp；
+   * - 竖图/方图：给"小图"形态（内容宽 42%，高度封顶 200vp），
+   *   避免满宽渲染成大横条并裁掉画面主体（官方此类图即为小图展示）。
+   */
+  private singleBox(row: FeedRow): MediaBox {
+    const box: MediaBox = new MediaBox();
+    const cw: number = this.contentWidthVp();
+    let ratio: number = 1.5;
+    if (row.coverW > 0 && row.coverH > 0) {
+      ratio = row.coverW / row.coverH;
+    }
+    if (ratio >= 1.2) {
+      let h: number = cw / ratio;
+      if (h < 150) {
+        h = 150;
+      }
+      if (h > 200) {
+        h = 200;
+      }
+      box.w = cw;
+      box.h = h;
+      return box;
+    }
+    let w: number = cw * 0.42;
+    let h: number = w / ratio;
+    if (h > 200) {
+      h = 200;
+      w = h * ratio;
+    }
+    box.w = w;
+    box.h = h;
+    return box;
+  }
+
+  /** 视频可见性变化：维护可播集合；滚动中不抢播（停止后再决定播哪个） */
+  private onVideoAreaChange(tid: string, ratio: number): void {
+    const idx: number = this.visibleVideos.indexOf(tid);
+    const playable: boolean = ratio >= 0.6;
+    if (playable && idx < 0) {
+      this.visibleVideos.push(tid);
+      if (!this.listScrolling) {
+        this.startPlay(tid);
+      }
+    } else if (!playable && idx >= 0) {
+      this.visibleVideos.splice(idx, 1);
+      if (this.playingTid === tid) {
+        this.playingTid = '';
+      }
+    }
+  }
+
+  /** 开始播放某视频：每次换视频复位为静音（对齐官方，避免突然出声） */
+  private startPlay(tid: string): void {
+    this.playingTid = tid;
+    this.videoMuted = true;
+  }
+
+  /** 静音开关触摸：标记按下态，避免点击穿透到卡片触发"打开帖子" */
+  private onMuteTouch(e: TouchEvent): void {
+    if (e.type === TouchType.Down) {
+      this.mutePressed = true;
+    } else if (e.type === TouchType.Up || e.type === TouchType.Cancel) {
+      // 延迟清除：父级卡片 Up 判定发生在同一事件派发内，需等其读完标记
+      setTimeout(() => {
+        this.mutePressed = false;
+      }, 0);
+    }
+  }
+
+  /** 滚动开始：暂停在播视频（滚动中反复起停体验差且费流量） */
+  private onFeedScrollStart(): void {
+    this.listScrolling = true;
+    if (this.playingTid.length > 0) {
+      this.playingTid = '';
+    }
+  }
+
+  /** 滚动停止：从当前可见视频帖中择一自动播放 */
+  private onFeedScrollStop(): void {
+    this.listScrolling = false;
+    if (this.playingTid.length === 0 && this.visibleVideos.length > 0) {
+      this.startPlay(this.visibleVideos[0]);
+    }
+  }
+
+  /**
+   * 官方资讯行
+   * @param tag 来源标签（频道名，如 NBA / 中国篮球 / 国际足球）
+   */
+  private mapNews(items: NbaNewsItem[], tag: string): FeedRow[] {
     const result: FeedRow[] = [];
     for (const n of items) {
       const row: FeedRow = new FeedRow();
       row.tid = n.tid;
       row.title = n.title;
-      row.tag = 'NBA';
+      row.tag = tag;
       row.time = n.publishTime.length >= 16 ? n.publishTime.substring(5, 16) : n.publishTime;
       row.meta = `${compactCount(n.replies)} 回复 · ${compactCount(n.lights)} 亮`;
       row.cover = n.img;
@@ -251,6 +499,13 @@ export struct HomePage {
     this.pageIndex = 0;
     this.cursor = '';
     this.hasMore = false;
+    // 官方频道状态复位（去重集合 / 回退标记 / 连续无收获计数）
+    this.officialSeen = new Set<string>();
+    this.officialFallback = false;
+    this.officialDryPages = 0;
+    // 内容重载：停止在播视频并清空可见集合，避免旧行残留播放
+    this.playingTid = '';
+    this.visibleVideos = [];
     if (!keepContent) {
       this.rows = [];
       this.ranks = [];
@@ -279,13 +534,33 @@ export struct HomePage {
         newRanks = await HupuApi.getHotRanks();
       } else if (ch.kind === ChannelKind.SCHEDULE) {
         newDays = this.orderDays(await NbaApi.getSchedule());
-      } else if (ch.kind === ChannelKind.NBA) {
-        newRows = this.mapNews(await NbaApi.getNews());
+      } else if (ch.newsSource.length > 0 || ch.kind === ChannelKind.NBA) {
+        // 官方资讯流（NBA / 中国篮球 / 国际足球）：替代帖子流，避免个人帖子混入
+        // 首屏为资讯页固定 30+ 条；上拉时用 topicId 对应的资讯板块捞官方历史（见 loadMore）
+        const src: string = ch.newsSource.length > 0 ? ch.newsSource : 'nba';
+        newRows = this.mapNews(await NbaApi.getLeagueNews(src), ch.name);
+        newCursor = '';
+        newHasMore = ch.officialSources.length > 0 && ch.topicId > 0;
+        // 首屏为资讯页，未消耗 PC 话题页，故页码从 0 起（上拉时从第 1 页开始捞）
+        newPage = 0;
+      } else if (ch.kind === ChannelKind.TOPIC && ch.officialSources.length > 0) {
+        // 纯官方频道：官方号发文 + PC 话题页第 1 页官方帖过滤
+        // 上拉时继续翻 PC 话题页捞官方历史帖（见 loadMore），滑到底才停
+        const off: OfficialFeed = await this.fetchOfficialRows(ch);
+        newRows = off.rows;
+        newCursor = '';
+        newHasMore = true;
+        newPage = 1;
+      } else if (ch.kind === ChannelKind.TOPIC) {
+        // 话题频道：PC 站分页流（支持无限滚动）
+        const res: ThreadListPage = await HupuApi.getForumThreads(ch.topicId, 1);
+        newRows = this.mapThreads(res.items, false);
+        newCursor = '';
+        newHasMore = res.hasMore;
+        newPage = 1;
       } else {
-        const res: ThreadListPage = ch.kind === ChannelKind.RECOMMEND
-          ? await HupuApi.getWalkingStreet(1, '')
-          : await HupuApi.getTopicThreads(ch.topicId, 1, '');
-        newRows = this.mapThreads(res.items, ch.id === 'recommend');
+        const res: ThreadListPage = await HupuApi.getWalkingStreet(1, '');
+        newRows = this.mapThreads(res.items, true);
         newCursor = res.cursor;
         newHasMore = res.hasMore;
         newPage = 1;
@@ -311,6 +586,14 @@ export struct HomePage {
       this.ranks = newRanks;
       this.days = newDays;
       this.strip = newStrip;
+      // 官方频道：把首屏 tid 登记进去重集合，上拉捞历史时不会重复展示
+      if (ch.officialSources.length > 0) {
+        for (const r of newRows) {
+          if (r.tid.length > 0) {
+            this.officialSeen.add(r.tid);
+          }
+        }
+      }
       this.activeKind = ch.kind;
       this.activeLeague = ch.matchLeague;
       this.pageIndex = newPage;
@@ -366,13 +649,53 @@ export struct HomePage {
     data.cursor = cursor;
     data.hasMore = hasMore;
     data.page = page;
-    CacheStore.put(this.getCtx(), `home/${channelId}`, JSON.stringify(data));
+    CacheStore.put(this.getCtx(), `${HOME_CACHE_PREFIX}${channelId}`, JSON.stringify(data));
+  }
+
+  /**
+   * 缓存行归一化：旧版本快照缺少新增字段（videoUrl/官方大卡数据等），
+   * 直接渲染会取到 undefined.length 崩溃，逐字段兜底。
+   */
+  private normalizeRows(raw: FeedRow[]): FeedRow[] {
+    const result: FeedRow[] = [];
+    if (!raw) {
+      return result;
+    }
+    for (const r of raw) {
+      const row: FeedRow = new FeedRow();
+      row.tid = r.tid ?? '';
+      row.title = r.title ?? '';
+      row.author = r.author ?? '';
+      row.userHeader = r.userHeader ?? '';
+      row.tag = r.tag ?? '';
+      row.time = r.time ?? '';
+      row.meta = r.meta ?? '';
+      row.cover = r.cover ?? '';
+      row.pics = r.pics ?? [];
+      row.isVideo = r.isVideo === true;
+      row.videoDur = r.videoDur ?? '';
+      row.officialCard = r.officialCard === true;
+      // 视频直链带时效 auth_key（数小时过期），缓存快照里的链接多已失效：
+      // 缓存阶段不自动播放（封面+时长仍正常显示），网络返回最新链接后再播
+      row.videoUrl = '';
+      row.coverW = r.coverW ?? 0;
+      row.coverH = r.coverH ?? 0;
+      row.replies = r.replies ?? 0;
+      row.lights = r.lights ?? 0;
+      row.shareNum = r.shareNum ?? 0;
+      row.viewNum = r.viewNum ?? 0;
+      row.lightReplyContent = r.lightReplyContent ?? '';
+      row.lightReplyUser = r.lightReplyUser ?? '';
+      row.lightReplyCount = r.lightReplyCount ?? 0;
+      result.push(row);
+    }
+    return result;
   }
 
   private async renderFromCache(channelId: string, seq: number): Promise<void> {
     let cached: CachedPayload | null = null;
     try {
-      cached = await CacheStore.get(this.getCtx(), `home/${channelId}`);
+      cached = await CacheStore.get(this.getCtx(), `${HOME_CACHE_PREFIX}${channelId}`);
     } catch (e) {
     }
     if (cached === null || seq !== this.loadSeq) {
@@ -383,7 +706,7 @@ export struct HomePage {
       if (!data) {
         return;
       }
-      this.rows = data.rows || [];
+      this.rows = this.normalizeRows(data.rows);
       this.ranks = data.ranks || [];
       this.days = data.days || [];
       this.strip = data.strip || [];
@@ -400,27 +723,206 @@ export struct HomePage {
     }
   }
 
+  /**
+   * 官方资讯优先：抓取该频道官方号发文 + PC 话题页官方帖过滤。
+   *
+   * 主源——官方号主页：`getUserPosts` 一次 20 条跨板块发文（快，一次请求），
+   *   按 topicId 过滤即得本频道最新官方帖。
+   * 补充源——PC 话题页第 1 页：单页约 50 条（是 m 站话题流的 5 倍），
+   *   过滤白名单官方号即得更多官方内容。**上拉时继续翻页捞历史**（见 loadMore）。
+   *
+   * 若两源合计仍少于 FALLBACK_MIN，说明该话题确无稳定官方内容，
+   * 回退展示原始帖子流——空频道比混入个人帖更糟。
+   */
+  private async fetchOfficialRows(ch: ChannelDef): Promise<OfficialFeed> {
+    const MIN_SUPPLEMENT: number = 12;
+    const FALLBACK_MIN: number = 3;
+    const feed: OfficialFeed = new OfficialFeed();
+    const merged: ThreadListItem[] = [];
+    const seen: Set<string> = new Set<string>();
+    this.officialSeen = seen;
+
+    // 主源：频道配置的官方号发文，按本频道板块过滤
+    if (ch.officialSources.length > 0) {
+      const puids: string[] = ch.officialSources.split(',');
+      for (const raw of puids) {
+        const puid: string = raw.trim();
+        if (puid.length === 0) {
+          continue;
+        }
+        try {
+          const posts: ThreadListItem[] = await HupuApi.getUserPosts(puid);
+          for (const it of posts) {
+            if (ch.topicId > 0 && it.topicId !== ch.topicId) {
+              continue;
+            }
+            if (it.tid.length === 0 || seen.has(it.tid)) {
+              continue;
+            }
+            seen.add(it.tid);
+            merged.push(it);
+          }
+        } catch (e) {
+        }
+      }
+    }
+
+    // 补充源：PC 话题页第 1 页的官方帖（PC 被风控时降级到 m 站话题流）
+    if (merged.length < MIN_SUPPLEMENT) {
+      let items: ThreadListItem[] = [];
+      try {
+        const res: ThreadListPage = await HupuApi.getForumThreads(ch.topicId, 1);
+        items = res.items;
+      } catch (e) {
+        try {
+          const res: ThreadListPage = await HupuApi.getTopicThreads(ch.topicId, 1, '');
+          items = res.items;
+        } catch (e2) {
+        }
+      }
+      for (const it of items) {
+        if (!OfficialAccounts.isOfficial(it.userName) || seen.has(it.tid)) {
+          continue;
+        }
+        seen.add(it.tid);
+        merged.push(it);
+      }
+    }
+
+    if (merged.length >= FALLBACK_MIN) {
+      feed.rows = this.mapThreads(merged, false);
+      return feed;
+    }
+    // 回退：原始帖子流
+    const raw: ThreadListPage = await HupuApi.getTopicThreads(ch.topicId, 1, '');
+    feed.rows = this.mapThreads(raw.items, false);
+    this.officialFallback = true;
+    return feed;
+  }
+
+  /**
+   * 官方频道加载更多：翻 PC 话题页捞官方历史帖（纯官方，绝不混入个人帖）。
+   * - 命中官方帖则追加
+   * - 连续 DRY_LIMIT 页无官方帖 → 判定官方内容已到底（滑到底就停）
+   * - 翻到 MAX_PAGE 或遇 WAF 风控 → 同样停止，不做无限重试
+   *
+   * 注：PC 话题页按"最后回复时间"排序，官方帖分布不均，故不因单页无收获就停，
+   * 需连续多页无收获才判定到底（避免过早截断历史内容）。
+   */
+  private async loadMoreOfficial(ch: ChannelDef): Promise<void> {
+    const MAX_PAGE: number = 30;
+    const DRY_LIMIT: number = 2;
+    // 单页命中率不均（搜索过滤后可能只有 2~5 条），内部连续翻页攒够 TARGET 条再返回，
+    // 避免"上拉一次页面毫无变化"的体验
+    const TARGET: number = 6;
+    const MAX_ROUNDS: number = 4;
+    const fresh: FeedRow[] = [];
+    for (let round: number = 0; round < MAX_ROUNDS; round++) {
+      if (this.pageIndex >= MAX_PAGE) {
+        this.hasMore = false;
+        break;
+      }
+      const page: number = this.pageIndex + 1;
+      this.pageIndex = page;
+      let items: ThreadListItem[] = [];
+      if (ch.historyKeyword.length > 0) {
+        // 资讯频道：搜索官方标志词（带图），按 fid 过滤到本频道板块
+        try {
+          const list: ThreadListItem[] = await HupuApi.searchThreads(ch.historyKeyword, page);
+          for (const it of list) {
+            if (it.fid === ch.topicId) {
+              items.push(it);
+            }
+          }
+        } catch (e) {
+          this.hasMore = false;
+          break;
+        }
+      } else {
+        // 话题频道：PC 话题页（无图，但纯官方）
+        try {
+          const res: ThreadListPage = await HupuApi.getForumThreads(ch.topicId, page);
+          items = res.items;
+        } catch (e) {
+          // 风控/网络异常：停止翻页（保留已加载内容），避免持续触发风控
+          this.hasMore = false;
+          break;
+        }
+      }
+      let hit: number = 0;
+      for (const it of items) {
+        // 双保险：搜索分支按 fid 过滤 + 官方号白名单；话题分支按白名单过滤
+        if (!OfficialAccounts.isOfficial(it.userName) || this.officialSeen.has(it.tid)) {
+          continue;
+        }
+        this.officialSeen.add(it.tid);
+        fresh.push(this.mapOne(it));
+        hit++;
+      }
+      this.officialDryPages = hit > 0 ? 0 : this.officialDryPages + 1;
+      if (fresh.length >= TARGET || this.officialDryPages >= DRY_LIMIT) {
+        break;
+      }
+    }
+    if (fresh.length > 0) {
+      this.rows = this.rows.concat(fresh);
+    }
+    if (this.officialDryPages >= DRY_LIMIT) {
+      this.hasMore = false;
+    }
+  }
+
+  /**
+   * 上拉加载更多。
+   * - 官方频道（含 NBA/中国篮球/国际足球等资讯类）：翻 PC 资讯板块捞官方历史帖，
+   *   官方内容耗尽即停（纯官方，绝不混入个人帖）
+   * - 推荐频道：walkingStreet cursor 分页（无限）
+   * - 普通话题频道：PC 站 page 分页（无限）
+   * - 热榜/赛程：固定榜单，无历史
+   */
   private async loadMore(): Promise<void> {
     if (this.loadingMore || !this.hasMore || this.state !== LoadState.Ready) {
       return;
     }
     const ch: ChannelDef = ChannelCatalog.find(this.activeChannelId);
-    if (ch.kind !== ChannelKind.TOPIC && ch.kind !== ChannelKind.RECOMMEND) {
+    const isRecommend: boolean = ch.kind === ChannelKind.RECOMMEND;
+    const isTopic: boolean = ch.kind === ChannelKind.TOPIC;
+    // 官方频道（含资讯类）：有官方号配置与板块才能捞历史
+    const isOfficial: boolean = ch.officialSources.length > 0 && ch.topicId > 0 && !this.officialFallback;
+    // 热榜/赛程为固定榜单；其余无官方号也无话题分页的频道同样不可加载
+    if (ch.kind === ChannelKind.HOT || ch.kind === ChannelKind.SCHEDULE
+      || (!isOfficial && !isTopic && !isRecommend)) {
+      this.hasMore = false;
       return;
     }
     this.loadingMore = true;
     const seq: number = this.loadSeq;
     try {
-      const res: ThreadListPage = ch.kind === ChannelKind.RECOMMEND
-        ? await HupuApi.getWalkingStreet(this.pageIndex + 1, this.cursor)
-        : await HupuApi.getTopicThreads(ch.topicId, this.pageIndex + 1, this.cursor);
-      if (seq !== this.loadSeq) {
-        return;
+      if (isOfficial) {
+        // 纯官方频道（含资讯类）：翻 PC 资讯板块捞官方历史帖
+        await this.loadMoreOfficial(ch);
+        if (seq !== this.loadSeq) {
+          return;
+        }
+      } else if (isRecommend) {
+        const res: ThreadListPage = await HupuApi.getWalkingStreet(this.pageIndex + 1, this.cursor);
+        if (seq !== this.loadSeq) {
+          return;
+        }
+        this.rows = this.rows.concat(this.mapThreads(res.items, true));
+        this.pageIndex = this.pageIndex + 1;
+        this.cursor = res.cursor;
+        this.hasMore = res.hasMore;
+      } else {
+        // 普通话题频道：PC 站分页（第 N 页 = /{topicId}-{N}）
+        const res: ThreadListPage = await HupuApi.getForumThreads(ch.topicId, this.pageIndex + 1);
+        if (seq !== this.loadSeq) {
+          return;
+        }
+        this.rows = this.rows.concat(this.mapThreads(res.items, false));
+        this.pageIndex = this.pageIndex + 1;
+        this.hasMore = res.hasMore;
       }
-      this.rows = this.rows.concat(this.mapThreads(res.items, this.activeChannelId === 'recommend'));
-      this.pageIndex = this.pageIndex + 1;
-      this.cursor = res.cursor;
-      this.hasMore = res.hasMore;
     } catch (e) {
     }
     this.loadingMore = false;
@@ -543,6 +1045,8 @@ export struct HomePage {
     }
     if (id !== this.activeChannelId) {
       AppStorage.setOrCreate<string>('activeChannelId', id);
+      // 直连持久化：不依赖 @Watch 时序，确保下次启动恢复
+      this.saveLastChannel(id);
     }
     try {
       this.channelScroller.scrollToIndex(idx, true, ScrollAlign.CENTER);
@@ -660,6 +1164,10 @@ export struct HomePage {
 
   /** 有效点击：位移小 + 列表未发生滚动 + 按压时长 < 400ms（防滑动/滚动误触跳帖） */
   private isValidTap(): boolean {
+    if (this.mutePressed) {
+      // 落在视频静音按钮上：只切静音，不进帖子
+      return false;
+    }
     return !this.itemMoved && !this.scrollArmed && (Date.now() - this.pressStartTs) < 400;
   }
 
@@ -888,8 +1396,11 @@ export struct HomePage {
         .textOverflow({ overflow: TextOverflow.Ellipsis })
         .width('100%')
 
-      // 图片区：多图 3 列网格 / 单图大图
-      if (row.pics.length >= 3) {
+      // 媒体区：视频（自动播放）/ 多图网格 / 单图大图
+      // 注：视频帖一律走 VideoBlock（videoUrl 为空时=缓存阶段，仅显示封面+时长，不播）
+      if (row.isVideo) {
+        this.VideoBlock(row)
+      } else if (row.pics.length >= 3) {
         Row({ space: 4 }) {
           ForEach(row.pics, (img: string, idx: number) => {
             ImageKnifeComponent({
@@ -925,13 +1436,14 @@ export struct HomePage {
         Stack({ alignContent: Alignment.BottomEnd }) {
           ImageKnifeComponent({
             imageKnifeOption: {
-              loadSrc: thumbUrl(row.pics.length === 1 ? row.pics[0] : row.cover, 480),
+              loadSrc: thumbUrl(row.pics.length === 1 ? row.pics[0] : row.cover, 640),
               objectFit: ImageFit.Cover,
               border: { radius: 6 }
             }
           })
-            .width('100%')
-            .height(180)
+            // 视频贴缺播放地址时兜底：仍按满宽横条展示封面
+            .width(row.isVideo ? this.contentWidthVp() : this.singleBox(row).w)
+            .height(row.isVideo ? this.mediaHeight(row) : this.singleBox(row).h)
           if (row.isVideo) {
             Text(row.videoDur.length > 0 ? row.videoDur : '视频')
               .fontSize(10)
@@ -942,21 +1454,171 @@ export struct HomePage {
               .margin(6)
           }
         }
-        .width('100%')
+        .width(this.singleBox(row).w)
       }
 
-      // 底部数据栏（官方三列风格，用文字标签避免图标乱码）
-      Row() {
-        Blank()
-        Text(`${row.meta}`)
+      // 神回复（亮评）：官方推荐流高亮评论
+      if (row.lightReplyContent.length > 0) {
+        this.LightReplyBlock(row)
+      }
+
+      // 底部数据栏：浏览 / 回复 / 亮 / 分享
+      Row({ space: 16 }) {
+        if (row.viewNum > 0) {
+          Text(`${compactCount(row.viewNum)} 浏览`)
+            .fontSize(11)
+            .fontColor($r('app.color.text_tertiary'))
+        }
+        Text(`${compactCount(row.replies)} 回复`)
           .fontSize(11)
           .fontColor($r('app.color.text_tertiary'))
+        Text(`${compactCount(row.lights)} 亮`)
+          .fontSize(11)
+          .fontColor($r('app.color.text_tertiary'))
+        if (row.shareNum > 0) {
+          Text(`${compactCount(row.shareNum)} 分享`)
+            .fontSize(11)
+            .fontColor($r('app.color.text_tertiary'))
+        }
       }
       .width('100%')
     }
     .alignItems(HorizontalAlign.Start)
     .width('100%')
     .padding({ top: 12, bottom: 12 })
+  }
+
+  /**
+   * 视频区：成为播放目标时渲染 Video 自动播放（静音循环），否则显示封面 + 播放按钮。
+   * 同一时刻只存在一个 Video 实例，滚动性能可控。
+   */
+  @Builder
+  VideoBlock(row: FeedRow) {
+    Stack({ alignContent: Alignment.BottomEnd }) {
+      Stack({ alignContent: Alignment.Center }) {
+        if (this.playingTid === row.tid) {
+          // Cover 铺满容器：竖屏视频裁切显示中段，消除黑边。
+          // controls(false)：去掉原生播放控件（暂停/进度/时间/全屏），对齐官方干净的播放画面
+          Video({ src: row.videoUrl })
+            .autoPlay(true)
+            .muted(this.videoMuted)
+            .loop(true)
+            .controls(false)
+            .objectFit(ImageFit.Cover)
+            .width('100%')
+            .height(this.mediaHeight(row))
+        } else {
+          ImageKnifeComponent({
+            imageKnifeOption: {
+              loadSrc: thumbUrl(row.cover, 640),
+              objectFit: ImageFit.Cover
+            }
+          })
+            .width('100%')
+            .height(this.mediaHeight(row))
+
+          Column() {
+            Text('▶')
+              .fontSize(16)
+              .fontColor(Color.White)
+          }
+          .width(46)
+          .height(46)
+          .justifyContent(FlexAlign.Center)
+          .backgroundColor('#59000000')
+          .borderRadius(23)
+        }
+      }
+      .width('100%')
+      .height(this.mediaHeight(row))
+
+      // 底部浮层：播放时左下角只有静音小喇叭（官方样式），未播放时右下角显示时长
+      if (this.playingTid === row.tid || row.videoDur.length > 0) {
+        Row() {
+          if (this.playingTid === row.tid) {
+            Row() {
+              SymbolGlyph(this.videoMuted
+                ? $r('sys.symbol.speaker_slash')
+                : $r('sys.symbol.speaker_wave_3'))
+                .fontSize(15)
+                .fontColor([Color.White])
+            }
+            .width(28)
+            .height(28)
+            .justifyContent(FlexAlign.Center)
+            .backgroundColor('#59000000')
+            .borderRadius(14)
+            .onTouch((e: TouchEvent) => {
+              this.onMuteTouch(e);
+            })
+            .onClick(() => {
+              this.videoMuted = !this.videoMuted;
+            })
+          }
+          Blank()
+          if (row.videoDur.length > 0 && this.playingTid !== row.tid) {
+            Text(row.videoDur)
+              .fontSize(10)
+              .fontColor(Color.White)
+              .backgroundColor('#80000000')
+              .borderRadius(3)
+              .padding({ left: 5, right: 5, top: 2, bottom: 2 })
+          }
+        }
+        .width('100%')
+        .alignItems(VerticalAlign.Center)
+        .padding(8)
+      }
+    }
+    .width('100%')
+    .borderRadius(8)
+    .clip(true)
+    .onVisibleAreaChange([0.0, 0.6], (isVisible: boolean, ratio: number) => {
+      // 无有效播放地址（缓存阶段）不参与自动播放，避免加载过期链接黑屏
+      if (row.videoUrl.length > 0) {
+        this.onVideoAreaChange(row.tid, ratio);
+      }
+    })
+  }
+
+  /** 神回复（亮评）块 */
+  @Builder
+  LightReplyBlock(row: FeedRow) {
+    Column({ space: 5 }) {
+      Row({ space: 6 }) {
+        Text('亮')
+          .fontSize(10)
+          .fontColor(Color.White)
+          .padding({ left: 5, right: 5, top: 1, bottom: 1 })
+          .backgroundColor($r('app.color.brand_primary'))
+          .borderRadius(3)
+        Text(row.lightReplyUser.length > 0 ? row.lightReplyUser : 'JRs')
+          .fontSize(12)
+          .fontColor($r('app.color.score_blue'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+        if (row.lightReplyCount > 0) {
+          Text(`${compactCount(row.lightReplyCount)} 亮`)
+            .fontSize(11)
+            .fontColor($r('app.color.text_tertiary'))
+        }
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+
+      Text(row.lightReplyContent)
+        .fontSize(13)
+        .lineHeight(19)
+        .fontColor($r('app.color.text_secondary'))
+        .maxLines(2)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .width('100%')
+    }
+    .width('100%')
+    .padding(10)
+    .backgroundColor($r('app.color.bg_page'))
+    .borderRadius(8)
   }
 
   /** 紧凑卡（NBA资讯/其它频道原有样式） */
@@ -1333,7 +1995,7 @@ export struct HomePage {
               }
             }, (row: FeedRow, idx: number) => `${row.tid}_${idx}`)
             ListItem() {
-              this.Footer(this.hasMore ? '上拉加载更多' : '已经到底了')
+              this.Footer(this.footerText())
             }
           }
           .onReachEnd(() => {
@@ -1348,9 +2010,11 @@ export struct HomePage {
           })
           .onScrollStart(() => {
             this.scrollArmed = true;
+            this.onFeedScrollStart();
           })
           .onScrollStop(() => {
             this.scrollArmed = false;
+            this.onFeedScrollStop();
           })
         }
         .onRefreshing(() => {

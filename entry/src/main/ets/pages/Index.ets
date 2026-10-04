@@ -15,6 +15,7 @@ import { PlayerScoreDetailPage } from './PlayerScoreDetailPage';
 import { PlayerProfilePage } from './PlayerProfilePage';
 import { CookieLoginPage } from './CookieLoginPage';
 import { UserSpacePage } from './UserSpacePage';
+import { CreateThreadPage } from './CreateThreadPage';
 import { RouteName } from '../common/Theme';
 import { HdsTabs, HdsTabsController, hdsMaterial } from '@kit.UIDesignKit';
 import { SymbolGlyphModifier } from '@kit.ArkUI';
@@ -25,6 +26,12 @@ struct Index {
   @Provide('pageStack') pageStack: NavPathStack = new NavPathStack();
   @State currentIndex: number = 0;
   private tabsController: HdsTabsController = new HdsTabsController();
+
+  /** 发帖页参数（可能未传，返回空串避免 undefined） */
+  private createThreadParam(): string {
+    const arr: string[] = this.pageStack.getParamByName(RouteName.CREATE_THREAD) as string[];
+    return arr.length > 0 ? arr[0] : '';
+  }
 
   private tabSymbol(normal: Resource, selected: Resource): TabBarSymbol {
     return {
@@ -63,6 +70,8 @@ struct Index {
       CookieLoginPage()
     } else if (name === RouteName.USER_SPACE) {
       UserSpacePage({ param: this.pageStack.getParamByName(RouteName.USER_SPACE)[0] as string })
+    } else if (name === RouteName.CREATE_THREAD) {
+      CreateThreadPage({ param: this.createThreadParam() })
     } else {
       Column({ space: 8 }) {
         Text(name)
